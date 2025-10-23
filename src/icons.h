@@ -86,7 +86,7 @@
 #define ICON_PDF           ICON_STR(FA_FILE_PDF_O, "󰈦", "📕")
 #define ICON_PHOTOSHOP     ICON_STR(DEV_PHOTOSHOP, "", "🖌️ ")
 #define ICON_PICTUREFILE   ICON_STR(FA_FILE_IMAGE_O, "", "🖼️ ")/*  󰈟 */
-#define ICON_PICTURES      ICON_STR(MD_CAMERA_ALT, "", "🎨")/* 󰉏 */
+#define ICON_PICTURES      ICON_STR(MD_CAMERA_ALT, "", "🎨")/* 󰉏  */
 #define ICON_PLAYLIST      ICON_STR(ICON_MUSICFILE, "", "🎶")/*󱍙  */
 #define ICON_POWERPOINT    ICON_STR(FILE_POWERPOINT, "󰈧", "📊")
 #define ICON_PUBLIC        ICON_STR(FA_INBOX, "󰖟", "👀")/*󰉌   󰖟 */
