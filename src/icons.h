@@ -48,7 +48,7 @@
 #define ICON_ARROW_DOWN    ICON_STR(MD_ARROW_DOWNWARD, "󰁅", "⬇")
 
 /* GENERIC */
-#define ICON_DIRECTORY     ICON_STR(FA_FOLDER, "", "📂")/*  󰉋 */
+#define ICON_DIRECTORY     ICON_STR(FA_FOLDER, "", "📂")/*  󰉋  */
 #define ICON_FILE          ICON_STR(FA_FILE, "", "📃")/*  󰈔*/
 #define ICON_EXEC          ICON_STR(FA_COG, "", "⚙️ ")/*   󱜧  */
 
