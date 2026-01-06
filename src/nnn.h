@@ -3,7 +3,7 @@
  *
  * Copyright (C) 2014-2016, Lazaros Koromilas <lostd@2f30.org>
  * Copyright (C) 2014-2016, Dimitris Papastamos <sin@2f30.org>
- * Copyright (C) 2016-2025, Arun Prakash Jana <engineerarun@gmail.com>
+ * Copyright (C) 2016-2026, Arun Prakash Jana <engineerarun@gmail.com>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -71,12 +71,10 @@ enum action {
 	SEL_CTX2,
 	SEL_CTX3,
 	SEL_CTX4,
-#ifdef CTX8
 	SEL_CTX5,
 	SEL_CTX6,
 	SEL_CTX7,
 	SEL_CTX8,
-#endif
 	SEL_MARK,
 	SEL_BMARK,
 	SEL_FLTR,
@@ -122,6 +120,7 @@ enum action {
 #ifndef NOMOUSE
 	SEL_CLICK,
 #endif
+	SEL_MAX,
 };
 
 /* Associate a pressed key to an action */
@@ -189,12 +188,10 @@ static struct key bindings[] = {
 	{ '2',            SEL_CTX2 },
 	{ '3',            SEL_CTX3 },
 	{ '4',            SEL_CTX4 },
-#ifdef CTX8
 	{ '5',            SEL_CTX5 },
 	{ '6',            SEL_CTX6 },
 	{ '7',            SEL_CTX7 },
 	{ '8',            SEL_CTX8 },
-#endif
 	/* Mark a path to visit later */
 	{ ',',            SEL_MARK },
 	/* Create a bookmark */
