@@ -103,6 +103,7 @@
 #include <stddef.h>
 #include <wctype.h>
 #include <stdalign.h>
+#include <stdbool.h>
 #ifndef __USE_XOPEN_EXTENDED
 #define __USE_XOPEN_EXTENDED 1
 #endif
@@ -150,7 +151,7 @@
 #endif
 
 /* Macro definitions */
-#define VERSION      "5.1"
+#define VERSION      "5.2"
 #define GENERAL_INFO "BSD 2-Clause\nhttps://github.com/jarun/nnn"
 
 #ifndef NOSSN
@@ -188,7 +189,7 @@
 #define ISLOWER_(ch)    ((ch) >= 'a' && (ch) <= 'z')
 #define CMD_LEN_MAX     (PATH_MAX + ((NAME_MAX + 1) << 1))
 #define ALIGN_UP(x, A)  ((((x) + (A) - 1) / (A)) * (A))
-#define READLINE_MAX    256
+#define READLINE_MAX    256UL
 #define FILTER          '/'
 #define RFILTER         '\\'
 #define CASE            ':'
@@ -201,6 +202,8 @@
 #define NUL_CHAR        '\0'
 #define REGEX_MAX       48
 #define ENTRY_INCR      64 /* Number of dir 'entry' structures to allocate per shot */
+#define ENTRY_INCR_DU   1024 /* Larger increment in du mode to reduce realloc and wait-for-threads */
+#define TASK_CAP_DU     256  /* Initial number of tasks for disk usage */
 #define NAMEBUF_INCR    0x800 /* 64 dir entries at once, avg. 32 chars per file name = 64*32B = 2KB */
 #define DESCRIPTOR_LEN  32
 #define _ALIGNMENT      0x10 /* 16-byte alignment */
@@ -367,7 +370,8 @@ typedef struct {
 	uint_t autoenter  : 1;  /* auto-enter dir in type-to-nav mode */
 	uint_t reserved2  : 1;
 	uint_t useeditor  : 1;  /* Use VISUAL to open text files */
-	uint_t reserved3  : 3;
+	uint_t reserved3  : 2;
+	uint_t fuzzy      : 1;  /* Use fuzzy filters */
 	uint_t regex      : 1;  /* Use regex filters */
 	uint_t x11        : 1;  /* Copy to system clipboard, show notis, xterm title */
 	uint_t timetype   : 2;  /* Time sort type (0: access, 1: change, 2: modification) */
@@ -477,6 +481,7 @@ static char hostname[_POSIX_HOST_NAME_MAX + 1];
 static char *fifopath;
 #endif
 static ullong_t *ihashbmp;
+static ullong_t *dir_dispatched_bmp; /* dir inodes already dispatched (avoid double-count same subtree) */
 static struct entry *pdents;
 static blkcnt_t dir_blocks;
 static kv *bookmark;
@@ -497,23 +502,51 @@ static char curssn[NAME_MAX + 1];
 #endif
 
 /* pthread related */
-#define NUM_DU_THREADS (4) /* Can use sysconf(_SC_NPROCESSORS_ONLN) */
-#define DU_TEST (((node->fts_info & FTS_F) && \
-		(sb->st_nlink <= 1 || test_set_bit((uint_t)sb->st_ino))) || node->fts_info & FTS_DP)
+#define NUM_DU_THREADS_MAX 32
 
-static int threadbmp = -1; /* Has 1 in the bit position for idle threads */
+static int num_du_threads;  /* Set from sysconf(_SC_NPROCESSORS_ONLN), 2..NUM_DU_THREADS_MAX */
 static volatile int active_threads;
 static pthread_mutex_t running_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t du_count_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t du_cond = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t work_cond = PTHREAD_COND_INITIALIZER;
+static volatile bool work_ready[NUM_DU_THREADS_MAX];
+static volatile bool du_shutdown;
+static pthread_t worker_tids[NUM_DU_THREADS_MAX];
+#if !defined(__GNUC__) && !defined(__clang__)
 static pthread_mutex_t hardlink_mutex = PTHREAD_MUTEX_INITIALIZER;
+#endif
+static bool first_call;
 static ullong_t *core_files;
 static blkcnt_t *core_blocks;
 static ullong_t num_files;
+
+typedef struct {
+	blkcnt_t blocks;
+	ullong_t files;
+	size_t pending;
+	int entnum;
+	bool mntpoint;
+	bool no_aggregate;
+} du_group;
+
+typedef struct {
+	char *path;
+	du_group *group;
+	bool count_root;
+} du_task;
+
+static du_task *du_tasks;
+static size_t du_task_len;
+static size_t du_task_cap;
+static size_t du_tasks_pending;
 
 typedef struct {
 	char path[PATH_MAX];
 	int entnum;
 	ushort_t core;
 	bool mntpoint;
+	bool no_aggregate; /* same dir seen twice (e.g. symlink); fill pdents only, don't add to totals */
 } thread_data;
 
 static thread_data *core_data;
@@ -858,7 +891,13 @@ static haiku_nm_h haiku_hnd;
 #define ENTSORT(pdents, ndents, entrycmpfn) qsort((pdents), (ndents), sizeof(*(pdents)), (entrycmpfn))
 #endif
 
-/* Forward declarations */
+#ifndef __GLIBC__
+#define xstrlen(s) strlen(s)
+#else
+#define xstrlen(s) ((char *)rawmemchr(s, '\0') - (s))
+#endif
+
+/* Function forward declarations */
 static void redraw(char *path);
 static int spawn(char *command, char *arg1, char *arg2, char *arg3, ushort_t flag);
 static void move_cursor(int target, int ignore_scrolloff);
@@ -869,6 +908,8 @@ static bool get_output(char *command, char *arg1, char *arg2, int fdout, bool pa
 #ifndef NOFIFO
 static void notify_fifo(bool force);
 #endif
+static inline bool selforparent(const char *path);
+static void dirwalk(char *path, int entnum, bool mountpoint, bool no_aggregate);
 
 /* Functions */
 
@@ -935,22 +976,40 @@ static uchar_t xchartohex(uchar_t c)
 
 /*
  * Source: https://elixir.bootlin.com/linux/latest/source/arch/alpha/include/asm/bitops.h
+ * Optimized: atomic test-and-set per word so different inodes (different words) don't contend.
  */
-static bool test_set_bit(uint_t nr)
+static inline bool test_set_bit(uint_t nr)
 {
 	nr &= HASH_BITS;
-
-	pthread_mutex_lock(&hardlink_mutex);
 	ullong_t *m = ihashbmp + (nr >> 6);
+	ullong_t bit = 1ULL << (nr & 63);
 
-	if (*m & (1 << (nr & 63))) {
+#if defined(__GNUC__) || defined(__clang__)
+	/* Relaxed ordering is sufficient: only need atomicity for this bitmap */
+	ullong_t old = __atomic_fetch_or(m, bit, __ATOMIC_RELAXED);
+	return (old & bit) == 0;
+#else
+	pthread_mutex_lock(&hardlink_mutex);
+	if (*m & bit) {
 		pthread_mutex_unlock(&hardlink_mutex);
 		return FALSE;
 	}
-
-	*m |= 1 << (nr & 63);
+	*m |= bit;
 	pthread_mutex_unlock(&hardlink_mutex);
+	return TRUE;
+#endif
+}
 
+/* Track directory (dev,ino) already dispatched; main-thread only, avoids double-counting same subtree */
+static bool test_set_bit_dir(dev_t dev, ino_t ino)
+{
+	uint_t nr = (uint_t)((ullong_t)dev ^ (ullong_t)ino) & HASH_BITS;
+	ullong_t *m = dir_dispatched_bmp + (nr >> 6);
+	ullong_t bit = 1ULL << (nr & 63);
+
+	if (*m & bit)
+		return FALSE;
+	*m |= bit;
 	return TRUE;
 }
 
@@ -1000,15 +1059,6 @@ static size_t xstrsncpy(char *restrict dst, const char *restrict src, size_t n)
 	}
 
 	return end - dst;
-}
-
-static inline size_t xstrlen(const char *restrict s)
-{
-#ifndef __GLIBC__
-	return strlen(s); // NOLINT
-#else
-	return (char *)rawmemchr(s, '\0') - s; // NOLINT
-#endif
 }
 
 static char *xstrdup(const char *restrict s)
@@ -1069,12 +1119,11 @@ static char *get_cwd_entry(const char *restrict cwdpath, char *entrypath, size_t
  * And we are NOT expecting a '/' at the end.
  * Ideally 0 < n <= xstrlen(s).
  */
+#if defined(__GLIBC__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__) || defined(__DragonFly__)
+#define xmemrchr(s, ch, n) memrchr(s, ch, n)
+#else
 static void *xmemrchr(uchar_t *restrict s, uchar_t ch, size_t n)
 {
-#if defined(__GLIBC__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__) || defined(__DragonFly__)
-	return memrchr(s, ch, n);
-#else
-
 	if (!s || !n)
 		return NULL;
 
@@ -1086,8 +1135,8 @@ static void *xmemrchr(uchar_t *restrict s, uchar_t ch, size_t n)
 	} while (s != ptr);
 
 	return NULL;
-#endif
 }
+#endif
 
 /* A very simplified implementation, changes path */
 static char *xdirname(char *path)
@@ -2058,7 +2107,7 @@ static void endselection(bool endselmode)
 }
 
 /* Returns: 1 - success, 0 - none selected, -1 - other failure */
-static int editselection(void)
+static int editselection(bool allowemptysel)
 {
 	int ret = -1;
 	int fd, lines = 0;
@@ -2066,7 +2115,7 @@ static int editselection(void)
 	struct stat sb;
 	time_t mtime;
 
-	if (!selbufpos) /* External selection is only editable at source */
+	if (!allowemptysel && !selbufpos) /* External selection is only editable at source */
 		return listselfile();
 
 	fd = create_tmp_file();
@@ -2075,7 +2124,8 @@ static int editselection(void)
 		return -1;
 	}
 
-	seltofile(fd, NULL, NEWLINE);
+	if (!allowemptysel)
+		seltofile(fd, NULL, NEWLINE);
 	if (close(fd)) {
 		DPRINTF_S(strerror(errno));
 		return -1;
@@ -2116,7 +2166,9 @@ static int editselection(void)
 		return 1;
 	}
 
-	if (sb.st_size > selbufpos) {
+	if (allowemptysel)
+		selbufrealloc(sb.st_size);
+	else if (sb.st_size > selbufpos) {
 		DPRINTF_S("edited buffer larger than previous");
 		if (unlink(g_tmpfpath)) {
 			DPRINTF_S(strerror(errno));
@@ -2162,7 +2214,7 @@ static int editselection(void)
 	/* Add a line for the last file */
 	++lines;
 
-	if (lines > nselected) {
+	if (!allowemptysel && (lines > nselected)) {
 		DPRINTF_S("files added to selection");
 		goto emptyedit;
 	}
@@ -2502,15 +2554,11 @@ static int spawn(char *command, char *arg1, char *arg2, char *arg3, ushort_t fla
 	} else
 		argv[index++] = command;
 
-	if (arg1) {
-		argv[index] = arg1;
-		++index;
-	}
+	if (arg1)
+		argv[index++] = arg1;
 
-	if (arg2) {
-		argv[index] = arg2;
-		++index;
-	}
+	if (arg2)
+		argv[index++] = arg2;
 
 	if (arg3)
 		argv[index] = arg3;
@@ -2704,6 +2752,9 @@ finish:
 static bool cpmvrm_selection(enum action sel, char *path)
 {
 	int r;
+
+	if ((sel == SEL_CP || sel == SEL_MV) && isselfileempty())
+		editselection(TRUE);
 
 	if (isselfileempty()) {
 		if (nselected)
@@ -3031,6 +3082,61 @@ static int setfilter(regex_t *regex, const char *filter)
 }
 #endif
 
+/* Normalize space, underscore, and hyphen to the same character for fuzzy matching */
+static inline wchar_t normalize_char(wchar_t c)
+{
+	if (c == L' ' || c == L'_' || c == L'-')
+		return L' ';
+	return c;
+}
+
+/*
+ * Fuzzy match: check if all characters in filter appear in order in fname
+ * Case-sensitivity is controlled by fnstrstr function pointer
+ * Supports wide characters and Unicode
+ */
+static int fuzzy_match(const char *filter, const char *fname)
+{
+	wchar_t filter_wcs[NAME_MAX], fname_wcs[NAME_MAX];
+	wchar_t *f, *n;
+	size_t filter_len, fname_len;
+	bool case_insensitive = (fnstrstr == &strcasestr);
+
+	/* Convert multi-byte strings to wide character strings */
+	filter_len = mbstowcs(filter_wcs, filter, NAME_MAX - 1);
+	if (filter_len == (size_t)-1)
+		return 0;
+	filter_wcs[filter_len] = L'\0';
+
+	if (!filter_len)
+		return 1;
+
+	fname_len = mbstowcs(fname_wcs, fname, NAME_MAX - 1);
+	if (fname_len == (size_t)-1)
+		return 0;
+	fname_wcs[fname_len] = L'\0';
+
+	/* Convert to lowercase if case-insensitive matching */
+	if (case_insensitive) {
+		for (size_t i = 0; i < filter_len; ++i)
+			filter_wcs[i] = towlower(filter_wcs[i]);
+		for (size_t i = 0; i < fname_len; ++i)
+			fname_wcs[i] = towlower(fname_wcs[i]);
+	}
+
+	f = filter_wcs;
+	n = fname_wcs;
+
+	/* Match characters in order */
+	while (*f && *n) {
+		if (normalize_char(*f) == normalize_char(*n))
+			++f;
+		++n;
+	}
+
+	return !*f;
+}
+
 static int visible_re(const fltrexp_t *fltrexp, const char *fname)
 {
 #ifdef PCRE2
@@ -3051,6 +3157,110 @@ static int visible_re(const fltrexp_t *fltrexp, const char *fname)
 static int visible_str(const fltrexp_t *fltrexp, const char *fname)
 {
 	return fnstrstr(fname, fltrexp->str) != NULL;
+}
+
+#ifdef DIM_FILTERED
+/*
+ * Get match positions for fuzzy matching
+ * Populates matched array with 1 for matched bytes, 0 otherwise
+ */
+static void fuzzy_match_positions(const char *filter, const char *fname, uchar_t *matched)
+{
+	wchar_t filter_wcs[NAME_MAX], fname_wcs[NAME_MAX];
+	size_t filter_len, fname_len;
+	bool case_insensitive = (fnstrstr == &strcasestr);
+	size_t f_idx, n_idx;
+
+	/* Clear matched array */
+	memset(matched, 0, NAME_MAX);
+
+	/* Convert multi-byte strings to wide character strings */
+	filter_len = mbstowcs(filter_wcs, filter, NAME_MAX - 1);
+	if (filter_len == (size_t)-1)
+		return;
+	filter_wcs[filter_len] = L'\0';
+
+	if (!filter_len)
+		return;
+
+	fname_len = mbstowcs(fname_wcs, fname, NAME_MAX - 1);
+	if (fname_len == (size_t)-1)
+		return;
+	fname_wcs[fname_len] = L'\0';
+
+	/* Convert to lowercase if case-insensitive matching */
+	if (case_insensitive) {
+		for (size_t i = 0; i < filter_len; ++i)
+			filter_wcs[i] = towlower(filter_wcs[i]);
+		for (size_t i = 0; i < fname_len; ++i)
+			fname_wcs[i] = towlower(fname_wcs[i]);
+	}
+
+	f_idx = 0;
+	n_idx = 0;
+
+	/* Match characters in order and mark them */
+	while (f_idx < filter_len && n_idx < fname_len) {
+		if (normalize_char(filter_wcs[f_idx]) == normalize_char(fname_wcs[n_idx])) {
+			/* Mark this wide character position as matched */
+			matched[n_idx] = 1;
+			++f_idx;
+		}
+		++n_idx;
+	}
+}
+
+/*
+ * Get match positions for string matching (substring)
+ * Populates matched array with 1 for matched bytes, 0 otherwise
+ */
+static void string_match_positions(const char *filter, const char *fname, uchar_t *matched)
+{
+	const char *pos;
+	size_t filter_len, i;
+
+	/* Clear matched array */
+	memset(matched, 0, NAME_MAX);
+
+	filter_len = strlen(filter);
+	if (!filter_len)
+		return;
+
+	/* Find the substring */
+	pos = fnstrstr(fname, filter);
+	if (pos) {
+		/* Convert string to wide characters to track positions */
+		wchar_t fname_wcs[NAME_MAX];
+		size_t fname_wcs_len = mbstowcs(fname_wcs, fname, NAME_MAX - 1);
+		if (fname_wcs_len == (size_t)-1)
+			return;
+
+		/* Find position in wide character string */
+		size_t matched_pos = 0;
+		const char *name_ptr = fname;
+		while (name_ptr < pos && matched_pos < fname_wcs_len) {
+			int mb_len = mblen(name_ptr, MB_LEN_MAX);
+			if (mb_len <= 0)
+				break;
+			name_ptr += mb_len;
+			++matched_pos;
+		}
+
+		/* Mark matched positions */
+		wchar_t filter_wcs[NAME_MAX];
+		size_t filter_wcs_len = mbstowcs(filter_wcs, filter, NAME_MAX - 1);
+		if (filter_wcs_len == (size_t)-1)
+			return;
+
+		for (i = 0; i < filter_wcs_len && matched_pos + i < NAME_MAX; ++i)
+			matched[matched_pos + i] = 1;
+	}
+}
+#endif
+
+static int visible_fuzzy(const fltrexp_t *fltrexp, const char *fname)
+{
+	return fuzzy_match(fltrexp->str, fname);
 }
 
 static int (*filterfn)(const fltrexp_t *fltr, const char *fname) = &visible_str;
@@ -3160,9 +3370,6 @@ static inline int handle_event(void)
  */
 static int nextsel(int presel)
 {
-#ifdef BENCH
-	return SEL_QUIT;
-#endif
 	wint_t c = presel;
 	int i = 0;
 	bool escaped = FALSE;
@@ -3300,9 +3507,11 @@ static void showfilterinfo(void)
 
 	if (cfg.fileinfo && ndents && get_output("file", "-b", pdents[cur].name, -1, FALSE))
 		mvaddstr(xlines - 2, 2, g_buf);
-	else
+	else {
+		const char *mode = cfg.regex ? "reg" : (cfg.fuzzy ? "fzy" : "str");
 		snprintf(info + i, REGEX_MAX - i - 1, "  %s [/], %s [:]",
-			 (cfg.regex ? "reg" : "str"), ((fnstrstr == &strcasestr) ? "ic" : "noic"));
+			 mode, ((fnstrstr == &strcasestr) ? "ic" : "noic"));
+	}
 
 	mvaddstr(xlines - 2, xcols - xstrlen(info), info);
 }
@@ -3336,15 +3545,14 @@ static int fill(const char *fltr, regex_t *re)
 	fltrexp_t fltrexp = { .regex = re, .str = fltr };
 #endif
 
-	for (int count = 0; count < ndents; ++count) {
-		if (filterfn(&fltrexp, pdents[count].name) == 0) {
-			if (count != --ndents) {
-				swap_ent(count, ndents);
-				--count;
-			}
+	int count = 0;
 
-			continue;
-		}
+	while (count < ndents) {
+		if (filterfn(&fltrexp, pdents[count].name) == 0) {
+			if (count != --ndents)
+				swap_ent(count, ndents);
+		} else
+			++count;
 	}
 
 	return ndents;
@@ -3539,12 +3747,26 @@ static int filterentries(char *path, char *lastname)
 				continue;
 			}
 
-			/* Toggle string or regex filter */
+			/* Toggle string/fuzzy/regex filter */
 			if (*ch == FILTER) {
-				ln[0] = (ln[0] == FILTER) ? RFILTER : FILTER;
+				if (cfg.regex) {
+					/* regex -> string */
+					ln[0] = FILTER;
+					cfg.regex = 0;
+					filterfn = &visible_str;
+				} else if (!cfg.fuzzy) {
+					/* string -> fuzzy */
+					ln[0] = FILTER;
+					cfg.fuzzy = 1;
+					filterfn = &visible_fuzzy;
+				} else {
+					/* fuzzy -> regex */
+					ln[0] = RFILTER;
+					cfg.regex = 1;
+					cfg.fuzzy = 0;
+					filterfn = &visible_re;
+				}
 				wln[0] = (uchar_t)ln[0];
-				cfg.regex ^= 1;
-				filterfn = cfg.regex ? &visible_re : &visible_str;
 				showfilter(ln);
 				continue;
 			}
@@ -3554,30 +3776,41 @@ static int filterentries(char *path, char *lastname)
 		} else if (len == REGEX_MAX - 1)
 			continue;
 
-		wln[len] = (wchar_t)*ch;
-		wln[++len] = '\0';
-		wcstombs(ln, wln, REGEX_MAX);
+		if (*ch != FILTER) {
+			wln[len] = (wchar_t)*ch;
+			wln[++len] = '\0';
+			wcstombs(ln, wln, REGEX_MAX);
+		}
 
 		/* Forward-filtering optimization:
 		 * - new matches can only be a subset of current matches.
 		 */
 		/* ndents = total; */
-#ifdef MATCHFLTR
 		r = matches(pln);
 		if (r <= 0) {
-			!r ? unget_wch(KEY_BACKSPACE) : showfilter(ln);
-#else
-		if (matches(pln) == -1) {
-			showfilter(ln);
-#endif
+			if (r == 0)
+				unget_wch(KEY_BACKSPACE);
+			attron((COLOR_PAIR(cfg.curctx + 1)) | A_REVERSE | A_STANDOUT);
+			printmsg_nc(ln);
+			attroff((COLOR_PAIR(cfg.curctx + 1)) | A_REVERSE | A_STANDOUT);
 			continue;
 		}
 
-		/* If the only match is a dir, auto-enter and cd into it */
-		if ((ndents == 1) && cfg.autoenter && (pdents[0].flags & DIR_OR_DIRLNK)) {
-			*ch = KEY_ENTER;
-			cur = 0;
-			goto end;
+		if (cfg.autoenter) {
+			/* If the only match is a dir, cd into it */
+			if ((ndents == 1) && (pdents[0].flags & DIR_OR_DIRLNK)) {
+				*ch = KEY_ENTER;
+				cur = 0;
+				goto end;
+			} else if ((*ch == FILTER) && *pln) {
+				/* If an exactly matching dir is present and filter key pressed, cd into it */
+				r = dentfind(pln, ndents);
+				if ((xstrcmp(pln, pdents[r].name) == 0) && (pdents[r].flags & DIR_OR_DIRLNK)) {
+					*ch = KEY_ENTER;
+					cur = r;
+					goto end;
+				}
+			}
 		}
 
 		/*
@@ -4401,6 +4634,102 @@ static uchar_t get_color_pair_name_ind(const struct entry *ent, char *pind, int 
 	return C_UND;
 }
 
+#ifdef DIM_FILTERED
+static void printent_name(const struct entry *ent, uint_t namecols)
+{
+	char * const fltr = g_ctx[cfg.curctx].c_fltr;
+
+	/* If there's a filter string, dim matching characters */
+	if (fltr[1]) {
+		uchar_t matched[NAME_MAX] = {0};
+		int match_attrs = A_DIM;
+
+		/* Get match positions based on filter type */
+		if (cfg.regex) {
+			/* For regex, we don't dim - just print normally */
+#ifndef NOLC
+			addwstr(unescape(ent->name, namecols));
+#else
+			addstr(unescape(ent->name, MIN(namecols, ent->nlen) + 1));
+#endif
+		} else if (cfg.fuzzy) {
+			/* Get fuzzy match positions */
+			fuzzy_match_positions(fltr + 1, ent->name, matched);
+#ifndef NOLC
+			wchar_t * const wbuf = unescape(ent->name, namecols);
+			uint_t col = 0;
+			for (wchar_t *p = wbuf; *p && col < namecols; ++p, ++col) {
+				if (matched[col]) {
+					attron(match_attrs);
+					addch(*p);
+					attroff(match_attrs);
+				} else {
+					addch(*p);
+				}
+			}
+#else
+			/* Non-wide character version for fuzzy dimming */
+			const char *name = unescape(ent->name, MIN(namecols, ent->nlen) + 1);
+			for (uint_t i = 0; (i < namecols) && name[i]; ++i) {
+				if (matched[i]) {
+					attron(match_attrs);
+					addch(name[i]);
+					attroff(match_attrs);
+				} else {
+					addch(name[i]);
+				}
+			}
+#endif
+		} else {
+			/* String match - dim the substring */
+			string_match_positions(fltr + 1, ent->name, matched);
+#ifndef NOLC
+			wchar_t * const wbuf = unescape(ent->name, namecols);
+			uint_t col = 0;
+			for (wchar_t *p = wbuf; *p && col < namecols; ++p, ++col) {
+				if (matched[col]) {
+					attron(match_attrs);
+					addch(*p);
+					attroff(match_attrs);
+				} else {
+					addch(*p);
+				}
+			}
+#else
+			/* Non-wide character version for string dimming */
+			const char *name = unescape(ent->name, MIN(namecols, ent->nlen) + 1);
+			for (uint_t i = 0; (i < namecols) && name[i]; ++i) {
+				if (matched[i]) {
+					attron(match_attrs);
+					addch(name[i]);
+					attroff(match_attrs);
+				} else {
+					addch(name[i]);
+				}
+			}
+#endif
+		}
+	} else {
+		/* No filter or filter not active - print normally */
+#ifndef NOLC
+		addwstr(unescape(ent->name, namecols));
+#else
+		addstr(unescape(ent->name, MIN(namecols, ent->nlen) + 1));
+#endif
+	}
+}
+#else
+/* Without dimming support, just print the name normally */
+static inline void printent_name(const struct entry *ent, uint_t namecols)
+{
+#ifndef NOLC
+	addwstr(unescape(ent->name, namecols));
+#else
+	addstr(unescape(ent->name, MIN(namecols, ent->nlen) + 1));
+#endif
+}
+#endif
+
 static void printent(int pdents_index, uint_t namecols, bool sel)
 {
 	const struct entry *ent = &pdents[pdents_index];
@@ -4460,11 +4789,7 @@ static void printent(int pdents_index, uint_t namecols, bool sel)
 	if (!ind)
 		++namecols;
 
-#ifndef NOLC
-	addwstr(unescape(ent->name, namecols));
-#else
-	addstr(unescape(ent->name, MIN(namecols, ent->nlen) + 1));
-#endif
+	printent_name(ent, namecols);
 
 	if (attrs)
 		attroff(attrs);
@@ -4482,7 +4807,7 @@ static void setcfg(settings newcfg)
 	/* Synchronize the global function pointers to match the new cfg. */
 	entrycmpfn = cfg.reverse ? &reventrycmp : &entrycmp;
 	namecmpfn = cfg.version ? &xstrverscasecmp : &xstricmp;
-	filterfn = cfg.regex ? &visible_re : &visible_str;
+	filterfn = cfg.regex ? &visible_re : (cfg.fuzzy ? &visible_fuzzy : &visible_str);
 }
 
 static void savecurctx(char *path, char *curname, int nextctx)
@@ -4642,7 +4967,7 @@ static bool load_session(const char *sname, char **path, char **lastdir, char **
 	*lastname = g_ctx[cfg.curctx].c_name;
 	/* Set correct sort and filter options */
 	set_sort_flags('\0');
-	filterfn = cfg.regex ? &visible_re : &visible_str;
+	filterfn = cfg.regex ? &visible_re : (cfg.fuzzy ? &visible_fuzzy : &visible_str);
 	xstrsncpy(curssn, sname ? sname : "@", NAME_MAX);
 	status = TRUE;
 
@@ -4781,15 +5106,11 @@ static bool get_output(char *command, char *arg1, char *arg2, int fdout, bool pa
 	if (!cmd)
 		return ret;
 
-	if (arg1) {
-		argv[index] = arg1;
-		++index;
-	}
+	if (arg1)
+		argv[index++] = arg1;
 
-	if (arg2) {
+	if (arg2)
 		argv[index] = arg2;
-		++index;
-	}
 
 	pid = fork();
 	if (pid == 0) {
@@ -4855,7 +5176,7 @@ static bool buffer_command_output(char * const cmds[], char *arg1, char *arg2, s
 		if (arg1)
 			argv[index++] = arg1;
 		if (arg2)
-			argv[index++] = arg2;
+			argv[index] = arg2;
 
 		pid_t pid = fork();
 		if (pid == 0) {
@@ -5180,22 +5501,35 @@ static bool xchmod(char *pathbuf, char *dir)
 {
 	struct stat sb;
 	mode_t mode;
+	int fd;
 
 	mkpath(dir, pdents[cur].name, pathbuf);
 
-	if (lstat(pathbuf, &sb) == -1)
+#ifdef O_NOFOLLOW
+	fd = open(pathbuf, O_RDONLY | O_NOFOLLOW);
+#else
+	fd = open(pathbuf, O_RDONLY);
+#endif
+	if (fd == -1)
 		return FALSE;
+
+	if (fstat(fd, &sb) == -1) {
+		close(fd);
+		return FALSE;
+	}
 
 	mode = sb.st_mode;
 
 	/* (Un)set (S_IXUSR | S_IXGRP | S_IXOTH) */
 	(0100 & mode) ? (mode &= ~0111) : (mode |= 0111);
 
-	if (chmod(pathbuf, mode) == 0) {
+	if (fchmod(fd, mode) == 0) {
+		close(fd);
 		pdents[cur].mode = mode;
 		return TRUE;
 	}
 
+	close(fd);
 	return FALSE;
 }
 
@@ -6168,6 +6502,20 @@ static bool handle_cmd(enum action sel, char *path, char *newpath)
 
 static void dentfree(void)
 {
+	/* Shut down DU worker threads so they exit and we can join */
+	if (g_state.duinit) {
+		pthread_mutex_lock(&running_mutex);
+		du_shutdown = true;
+		for (size_t i = 0; i < du_task_len; ++i)
+			free(du_tasks[i].path);
+		du_task_len = 0;
+		du_tasks_pending = 0;
+		pthread_cond_broadcast(&work_cond);
+		pthread_mutex_unlock(&running_mutex);
+		for (int i = 0; i < num_du_threads; ++i)
+			pthread_join(worker_tids[i], NULL);
+	}
+
 	free(pnamebuf);
 	free(pdents);
 	free(mark);
@@ -6176,101 +6524,294 @@ static void dentfree(void)
 	free(core_blocks);
 	free(core_data);
 	free(core_files);
+	free(du_tasks);
 }
 
-static void *du_thread(void *p_data)
+/* Walk a directory tree using readdir to reduce FTS overhead */
+static bool du_queue_task(const char *path, du_group *group, bool count_root, bool inc_pending)
 {
-	thread_data *pdata = (thread_data *)p_data;
-	char *path[2] = {pdata->path, NULL};
-	ullong_t tfiles = 0;
-	blkcnt_t tblocks = 0;
-	struct stat *sb;
-	FTS *tree = fts_open(path, FTS_PHYSICAL | FTS_XDEV | FTS_NOCHDIR, 0);
-	FTSENT *node;
-
-	while ((node = fts_read(tree))) {
-		if (node->fts_info & FTS_D) {
-			if (g_state.interrupt)
-				break;
-			continue;
-		}
-
-		sb = node->fts_statp;
-
-		if (cfg.apparentsz) {
-			if (sb->st_size && DU_TEST)
-				tblocks += sb->st_size;
-		} else if (sb->st_blocks && DU_TEST)
-			tblocks += sb->st_blocks;
-
-		++tfiles;
+	if (inc_pending) {
+		pthread_mutex_lock(&du_count_mutex);
+		++group->pending;
+		pthread_mutex_unlock(&du_count_mutex);
 	}
 
-	fts_close(tree);
-
-	if (pdata->entnum >= 0)
-		pdents[pdata->entnum].blocks = tblocks;
-
-	if (!pdata->mntpoint) {
-		core_blocks[pdata->core] += tblocks;
-		core_files[pdata->core] += tfiles;
-	} else
-		core_files[pdata->core] += 1;
-
 	pthread_mutex_lock(&running_mutex);
-	threadbmp |= (1 << pdata->core);
-	--active_threads;
+	if (g_state.interrupt) {
+		pthread_mutex_unlock(&running_mutex);
+		if (inc_pending) {
+			pthread_mutex_lock(&du_count_mutex);
+			--group->pending;
+			pthread_mutex_unlock(&du_count_mutex);
+		}
+		return false;
+	}
+
+	if (du_task_len == du_task_cap) {
+		size_t newcap = du_task_cap ? (du_task_cap << 1) : TASK_CAP_DU;
+		du_task *tmp = realloc(du_tasks, newcap * sizeof(*du_tasks));
+		if (!tmp) {
+			pthread_mutex_unlock(&running_mutex);
+			if (inc_pending) {
+				pthread_mutex_lock(&du_count_mutex);
+				--group->pending;
+				pthread_mutex_unlock(&du_count_mutex);
+			}
+			return false;
+		}
+		du_tasks = tmp;
+		du_task_cap = newcap;
+	}
+
+	du_tasks[du_task_len++] = (du_task){
+		.path = xstrdup(path),
+		.group = group,
+		.count_root = count_root,
+	};
+	if (!du_tasks[du_task_len - 1].path) {
+		--du_task_len;
+		pthread_mutex_unlock(&running_mutex);
+		if (inc_pending) {
+			pthread_mutex_lock(&du_count_mutex);
+			--group->pending;
+			pthread_mutex_unlock(&du_count_mutex);
+		}
+		return false;
+	}
+	++du_tasks_pending;
+	pthread_cond_signal(&work_cond);
 	pthread_mutex_unlock(&running_mutex);
 
+	return true;
+}
+
+/* Add blocks from stat to total */
+static inline void add_blocks(blkcnt_t *tblocks, const struct stat *sb)
+{
+	if (cfg.apparentsz)
+		*tblocks += sb->st_size;
+	else if (sb->st_blocks)
+		*tblocks += sb->st_blocks;
+}
+
+static void du_walk_dir(const char *root, du_group *group, bool count_root, ullong_t *tfiles, blkcnt_t *tblocks)
+{
+	struct stat sb_root;
+	if (fstatat(AT_FDCWD, root, &sb_root, AT_SYMLINK_NOFOLLOW) == -1)
+		return;
+	if (!S_ISDIR(sb_root.st_mode))
+		return;
+
+	const dev_t root_dev = sb_root.st_dev;
+
+	/* Count root dir itself */
+	if (count_root) {
+		add_blocks(tblocks, &sb_root);
+		++(*tfiles);
+	}
+
+	DIR *dirp = opendir(root);
+	if (!dirp)
+		return;
+
+	const int dfd = dirfd(dirp);
+	struct dirent *dp;
+	while ((dp = readdir(dirp)) && !g_state.interrupt) {
+		if (selforparent(dp->d_name))
+			continue;
+
+		const unsigned char dtype = dp->d_type;
+		bool is_dir = (dtype == DT_DIR);
+		bool is_reg = (dtype == DT_REG);
+		bool sb_valid = false;
+
+		struct stat sb;
+		if (dtype == DT_UNKNOWN) {
+			if (fstatat(dfd, dp->d_name, &sb, AT_SYMLINK_NOFOLLOW) == -1)
+				continue;
+			sb_valid = true;
+			is_dir = S_ISDIR(sb.st_mode);
+			is_reg = S_ISREG(sb.st_mode);
+		}
+
+		/* Count blocks for directories and regular files */
+		if (is_dir) {
+			/* Stat if we haven't already */
+			if (!sb_valid) {
+				if (fstatat(dfd, dp->d_name, &sb, AT_SYMLINK_NOFOLLOW) == -1)
+					continue;
+				sb_valid = true;
+			}
+			add_blocks(tblocks, &sb);
+		} else if (is_reg) {
+			/* Stat if we haven't already */
+			if (!sb_valid) {
+				if (fstatat(dfd, dp->d_name, &sb, AT_SYMLINK_NOFOLLOW) == -1)
+					continue;
+				sb_valid = true;
+			}
+			/* Do not recount hard links */
+			if (sb.st_size && (sb.st_nlink <= 1 || test_set_bit((uint_t)sb.st_ino)))
+				add_blocks(tblocks, &sb);
+		}
+
+		++(*tfiles);
+
+		/* Add subdirectories to task queue for worker threads */
+		if (is_dir) {
+			/* Stat if we haven't already to get device for xdev check */
+			if (!sb_valid) {
+				if (fstatat(dfd, dp->d_name, &sb, AT_SYMLINK_NOFOLLOW) == -1)
+					continue;
+			}
+			if (sb.st_dev == root_dev) {
+				char childbuf[PATH_MAX];
+				mkpath(root, dp->d_name, childbuf);
+				du_queue_task(childbuf, group, false, true);
+			}
+		}
+	}
+
+	closedir(dirp);
+}
+
+static void *du_worker_loop(void *p_data)
+{
+	thread_data *pdata = (thread_data *)p_data;
+	const int core = (int)pdata->core;
+	du_task task = {0};
+
+#ifdef __linux__
+	/* Pin thread to specific CPU core for better cache locality and parallelism */
+	cpu_set_t cpuset;
+	CPU_ZERO(&cpuset);
+	int num_cpus = (int)sysconf(_SC_NPROCESSORS_ONLN);
+	if (num_cpus > 0)
+		CPU_SET(core % num_cpus, &cpuset);
+	pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+#endif
+
+	for (;;) {
+		pthread_mutex_lock(&running_mutex);
+		while (du_task_len == 0 && !du_shutdown)
+			pthread_cond_wait(&work_cond, &running_mutex);
+		if (du_shutdown) {
+			pthread_mutex_unlock(&running_mutex);
+			return NULL;
+		}
+
+		task = du_tasks[--du_task_len];
+		++active_threads;
+		pthread_mutex_unlock(&running_mutex);
+
+		ullong_t tfiles = 0;
+		blkcnt_t tblocks = 0;
+		du_walk_dir(task.path, task.group, task.count_root, &tfiles, &tblocks);
+		free(task.path);
+
+		/* Aggregate into the shared group and finalize when done */
+		pthread_mutex_lock(&du_count_mutex);
+		task.group->blocks += tblocks;
+		task.group->files += tfiles;
+		if (task.group->pending > 0)
+			--task.group->pending;
+		bool done = (task.group->pending == 0);
+		if (done) {
+			if (task.group->entnum >= 0)
+				pdents[task.group->entnum].blocks = task.group->blocks;
+
+			if (!task.group->no_aggregate) {
+				if (!task.group->mntpoint) {
+					core_blocks[core] += task.group->blocks;
+					core_files[core] += task.group->files;
+				} else
+					core_files[core] += 1;
+			}
+		}
+		pthread_mutex_unlock(&du_count_mutex);
+		if (done)
+			free(task.group);
+
+		pthread_mutex_lock(&running_mutex);
+		--active_threads;
+		if (du_tasks_pending > 0)
+			--du_tasks_pending;
+		pthread_cond_signal(&du_cond); /* signal instead of broadcast for better performance */
+		pthread_mutex_unlock(&running_mutex);
+	}
+	/* not reached */
 	return NULL;
 }
 
-static void dirwalk(char *path, int entnum, bool mountpoint)
+/* Assign one subdirectory to a worker; subdirectories are scanned in parallel by the pool */
+static void dirwalk(char *path, int entnum, bool mountpoint, bool no_aggregate)
 {
-	/* Loop till any core is free */
-	while (active_threads == NUM_DU_THREADS);
-
 	if (g_state.interrupt)
 		return;
 
-	pthread_mutex_lock(&running_mutex);
-	int core = ffs(threadbmp) - 1;
+	du_group *group = calloc(1, sizeof(*group));
+	if (!group)
+		return;
+	group->pending = 1;
+	group->entnum = entnum;
+	group->mntpoint = mountpoint;
+	group->no_aggregate = no_aggregate;
 
-	threadbmp &= ~(1 << core);
-	++active_threads;
-	pthread_mutex_unlock(&running_mutex);
+	if (!du_queue_task(path, group, true, false)) {
+		free(group);
+		return;
+	}
 
-	xstrsncpy(core_data[core].path, path, PATH_MAX);
-	core_data[core].entnum = entnum;
-	core_data[core].core = (ushort_t)core;
-	core_data[core].mntpoint = mountpoint;
-
-	pthread_t tid = 0;
-
-	pthread_create(&tid, NULL, du_thread, (void *)&(core_data[core]));
-
-	tolastln();
-	addstr(xbasename(path));
-	addstr(" [^C aborts]\n");
-	refresh();
+	if (first_call) {
+		tolastln();
+		addstr("[^C aborts]\n");
+		refresh();
+		first_call = FALSE;
+	}
 }
 
 static bool prep_threads(void)
 {
 	if (!g_state.duinit) {
-		/* drop MSB 1s */
-		threadbmp >>= (32 - NUM_DU_THREADS);
+		long n = sysconf(_SC_NPROCESSORS_ONLN);
+
+		/* Create one thread per CPU core for optimal parallelism */
+		num_du_threads = (n > 0 && n <= NUM_DU_THREADS_MAX) ? (int)n : 4;
+		if (num_du_threads < 2)
+			num_du_threads = 2;
+		du_shutdown = false;
+		for (int i = 0; i < num_du_threads; ++i)
+			work_ready[i] = false;
+		active_threads = 0;
+		du_task_len = 0;
+		du_tasks_pending = 0;
+		if (!du_task_cap)
+			du_task_cap = TASK_CAP_DU;
+		if (!du_tasks)
+			du_tasks = calloc(du_task_cap, sizeof(*du_tasks));
 
 		if (!core_blocks)
-			core_blocks = calloc(NUM_DU_THREADS, sizeof(blkcnt_t));
+			core_blocks = calloc((size_t)num_du_threads, sizeof(blkcnt_t));
 		if (!core_data)
-			core_data = calloc(NUM_DU_THREADS, sizeof(thread_data));
+			core_data = calloc((size_t)num_du_threads, sizeof(thread_data));
 		if (!core_files)
-			core_files = calloc(NUM_DU_THREADS, sizeof(ullong_t));
+			core_files = calloc((size_t)num_du_threads, sizeof(ullong_t));
 
-		if (!core_blocks || !core_data || !core_files) {
+		if (!core_blocks || !core_data || !core_files || !du_tasks) {
 			printwarn(NULL);
 			return FALSE;
+		}
+		for (int i = 0; i < num_du_threads; ++i) {
+			core_data[i].core = (ushort_t)i;
+			if (pthread_create(&worker_tids[i], NULL, du_worker_loop,
+			    (void *)&core_data[i]) != 0) {
+				du_shutdown = true;
+				pthread_cond_broadcast(&work_cond);
+				while (i--)
+					pthread_join(worker_tids[i], NULL);
+				printwarn(NULL);
+				return FALSE;
+			}
 		}
 #ifndef __APPLE__
 		/* Increase current open file descriptor limit */
@@ -6278,9 +6819,15 @@ static bool prep_threads(void)
 #endif
 		g_state.duinit = TRUE;
 	} else {
-		memset(core_blocks, 0, NUM_DU_THREADS * sizeof(blkcnt_t));
-		memset(core_data, 0, NUM_DU_THREADS * sizeof(thread_data));
-		memset(core_files, 0, NUM_DU_THREADS * sizeof(ullong_t));
+		memset(core_blocks, 0, (size_t)num_du_threads * sizeof(blkcnt_t));
+		memset(core_data, 0, (size_t)num_du_threads * sizeof(thread_data));
+		memset(core_files, 0, (size_t)num_du_threads * sizeof(ullong_t));
+		pthread_mutex_lock(&running_mutex);
+		for (size_t i = 0; i < du_task_len; ++i)
+			free(du_tasks[i].path);
+		du_task_len = 0;
+		du_tasks_pending = 0;
+		pthread_mutex_unlock(&running_mutex);
 	}
 	return TRUE;
 }
@@ -6313,6 +6860,7 @@ static int dentfill(char *path, struct entry **ppdents)
 	int fd = dirfd(dirp);
 
 	if (cfg.blkorder) {
+		first_call = TRUE;
 		num_files = 0;
 		dir_blocks = 0;
 		buf = g_buf;
@@ -6326,6 +6874,13 @@ static int dentfill(char *path, struct entry **ppdents)
 				goto exit;
 		} else
 			memset(ihashbmp, 0, HASH_OCTETS << 3);
+
+		if (!dir_dispatched_bmp) {
+			dir_dispatched_bmp = calloc(1, HASH_OCTETS << 3);
+			if (!dir_dispatched_bmp)
+				goto exit;
+		} else
+			memset(dir_dispatched_bmp, 0, HASH_OCTETS << 3);
 
 		if (!prep_threads())
 			goto exit;
@@ -6369,17 +6924,27 @@ static int dentfill(char *path, struct entry **ppdents)
 			if (fstatat(fd, namep, &sb, AT_SYMLINK_NOFOLLOW) == -1)
 				continue;
 
-			if (S_ISDIR(sb.st_mode)) {
-				if (sb_path.st_dev == sb.st_dev) { // NOLINT
+			/* Use resolved (dev,ino) for duplicate check (symlink-to-dir vs real dir) */
+			struct stat sb_dir_h;
+			if (S_ISLNK(sb.st_mode)) {
+				sb_dir_h.st_mode = 0;
+				fstatat(fd, namep, &sb_dir_h, 0);
+			} else
+				sb_dir_h = sb;
+
+			if (S_ISDIR(sb_dir_h.st_mode)) {
+				if (sb_path.st_dev == sb_dir_h.st_dev) { // NOLINT
 					mkpath(path, namep, buf); // NOLINT
-					dirwalk(buf, -1, FALSE);
+					bool first = test_set_bit_dir(sb_dir_h.st_dev, sb_dir_h.st_ino);
+					dirwalk(buf, -1, FALSE, !first);
 
 					if (g_state.interrupt)
 						goto exit;
 				}
+				++num_files; /* Count directories */
 			} else {
 				/* Do not recount hard links */
-				if (sb.st_nlink <= 1 || test_set_bit((uint_t)sb.st_ino))
+				if (sb.st_size && S_ISREG(sb.st_mode) && (sb.st_nlink <= 1 || test_set_bit((uint_t)sb.st_ino)))
 					dir_blocks += (cfg.apparentsz ? sb.st_size : sb.st_blocks);
 				++num_files;
 			}
@@ -6403,10 +6968,14 @@ static int dentfill(char *path, struct entry **ppdents)
 		}
 
 		if (ndents == total_dents) {
-			if (cfg.blkorder)
-				while (active_threads);
+			if (cfg.blkorder) {
+				pthread_mutex_lock(&running_mutex);
+				while (du_tasks_pending)
+					pthread_cond_wait(&du_cond, &running_mutex);
+				pthread_mutex_unlock(&running_mutex);
+			}
 
-			total_dents += ENTRY_INCR;
+			total_dents += cfg.blkorder ? ENTRY_INCR_DU : ENTRY_INCR;
 			*ppdents = xrealloc(*ppdents, total_dents * sizeof(**ppdents));
 			if (!*ppdents) {
 				free(pnamebuf);
@@ -6500,18 +7069,28 @@ static int dentfill(char *path, struct entry **ppdents)
 		}
 
 		if (cfg.blkorder) {
-			if (S_ISDIR(sb.st_mode)) {
+			/* Use resolved (dev,ino) for duplicate check so symlink-to-dir and real dir count once when at / */
+			struct stat sb_dir;
+			if (S_ISLNK(sb.st_mode)) {
+				sb_dir.st_mode = 0;
+				fstatat(fd, namep, &sb_dir, 0);
+			} else
+				sb_dir = sb;
+
+			if (S_ISDIR(sb_dir.st_mode)) {
 				mkpath(path, namep, buf); // NOLINT
 
-				/* Need to show the disk usage of this dir */
-				dirwalk(buf, ndents, (sb_path.st_dev != sb.st_dev)); // NOLINT
+				/* Need to show the disk usage of this dir; skip adding to totals if same dir already dispatched (e.g. symlink) */
+				bool first = test_set_bit_dir(sb_dir.st_dev, sb_dir.st_ino);
+				dirwalk(buf, ndents, (sb_path.st_dev != sb_dir.st_dev), !first); // NOLINT
 
 				if (g_state.interrupt)
 					goto exit;
+				++num_files; /* Count directories */
 			} else {
 				dentp->blocks = (cfg.apparentsz ? sb.st_size : sb.st_blocks);
 				/* Do not recount hard links */
-				if (sb.st_nlink <= 1 || test_set_bit((uint_t)sb.st_ino))
+				if (sb.st_size && S_ISREG(sb.st_mode) && (sb.st_nlink <= 1 || test_set_bit((uint_t)sb.st_ino)))
 					dir_blocks += dentp->blocks;
 				++num_files;
 			}
@@ -6538,10 +7117,13 @@ static int dentfill(char *path, struct entry **ppdents)
 
 exit:
 	if (g_state.duinit && cfg.blkorder) {
-		while (active_threads);
+		pthread_mutex_lock(&running_mutex);
+		while (du_tasks_pending)
+			pthread_cond_wait(&du_cond, &running_mutex);
+		pthread_mutex_unlock(&running_mutex);
 
 		attroff(COLOR_PAIR(cfg.curctx + 1));
-		for (int i = 0; i < NUM_DU_THREADS; ++i) {
+		for (int i = 0; i < num_du_threads; ++i) {
 			num_files += core_files[i];
 			dir_blocks += core_blocks[i];
 		}
@@ -7376,13 +7958,13 @@ static bool browse(char *ipath, int pkey)
 
 	newpath[0] = runfile[0] = '\0';
 
-	presel = pkey ? ((pkey == CREATE_NEW_KEY) ? 'n' : ';') : ((cfg.filtermode
+	presel = pkey ? ((pkey == CREATE_NEW_KEY) ? 'n' : ';') : (((cfg.filtermode
 #ifndef NOSSN
 			|| (curssn[0] && (g_ctx[cfg.curctx].c_fltr[0] == FILTER
 				|| g_ctx[cfg.curctx].c_fltr[0] == RFILTER)
 				&& g_ctx[cfg.curctx].c_fltr[1])
 #endif
-			) ? FILTER : 0);
+			) && !cfg.blkorder) ? FILTER : 0);
 
 	pdents = xrealloc(pdents, total_dents * sizeof(struct entry));
 	if (!pdents)
@@ -7477,6 +8059,11 @@ begin:
 			redraw(path);
 			statusbar(path);
 		}
+
+#ifdef BENCH
+		/* Lod and exit for performance profiling e.g. to run 'time nnn -T d /' */
+		return EXIT_SUCCESS;
+#endif
 
 nochange:
 		/* Exit if parent has exited */
@@ -8196,7 +8783,7 @@ nochange:
 #endif
 			continue;
 		case SEL_SELEDIT:
-			r = editselection();
+			r = editselection(FALSE);
 			if (r <= 0) {
 				r = !r ? MSG_0_SELECTED : MSG_FAILED;
 				printwait(messages[r], &presel);
@@ -8207,7 +8794,7 @@ nochange:
 #endif
 				cfg.filtermode ?  presel = FILTER : statusbar(path);
 			}
-			goto nochange;
+			goto begin;
 		case SEL_CP: // fallthrough
 		case SEL_MV: // fallthrough
 		case SEL_CPMVAS: // fallthrough
@@ -8515,14 +9102,13 @@ nochange:
 						return EXIT_SUCCESS;
 				} while (handle_cur_move(action));
 
-				if (action == SEL_REDRAW)
-					r = TRUE;
-
 				copycurname();
 
 				if (!r) {
 					cfg.filtermode ? presel = FILTER : statusbar(path);
-					goto nochange;
+
+					if (action != SEL_REDRAW)
+						goto nochange;
 				}
 			} else { /* 'Return/Enter' enters the plugin directory */
 				g_state.runplugin ^= 1;
@@ -8981,6 +9567,7 @@ static void usage(void)
 #ifndef NOX11
 		" -x      notis, selection sync, xterm title\n"
 #endif
+		" -z      in order fuzzy filters\n"
 		" -0      null separator in picker mode\n"
 		" -h      show help\n\n"
 		"v%s\n%s\n", __func__, VERSION, GENERAL_INFO);
@@ -9103,6 +9690,7 @@ static void cleanup(void)
 	free(pluginstr);
 	free(listroot);
 	free(ihashbmp);
+	free(dir_dispatched_bmp);
 	free(bookmark);
 	free(plug);
 	if (lastcmdpos != INVALID_POS)
@@ -9139,7 +9727,7 @@ int main(int argc, char *argv[])
 
 	while ((opt = (env_opts_id > 0
 		       ? env_opts[--env_opts_id]
-		       : getopt(argc, argv, "aAb:BcCdDeEfF:gHiJKl:nNop:P:QrRs:St:T:uUVx0h"))) != -1) {
+		       : getopt(argc, argv, "aAb:BcCdDeEfF:gHiJKl:nNop:P:QrRs:St:T:uUVxz0h"))) != -1) {
 		switch (opt) {
 #ifndef NOFIFO
 		case 'a':
@@ -9188,6 +9776,8 @@ int main(int argc, char *argv[])
 			break;
 #endif
 		case 'g':
+			if (cfg.fuzzy)
+				return EXIT_FAILURE;
 			cfg.regex = 1;
 			filterfn = &visible_re;
 			break;
@@ -9287,6 +9877,12 @@ int main(int argc, char *argv[])
 		case 'x':
 			cfg.x11 = 1;
 			break;
+		case 'z':
+			if (cfg.regex)
+				return EXIT_FAILURE;
+			cfg.fuzzy = 1;
+			filterfn = &visible_fuzzy;
+			break;
 		case '0':
 			sepnul = TRUE;
 			break;
@@ -9328,8 +9924,10 @@ int main(int argc, char *argv[])
 		/* We return to tty */
 		if (!isatty(STDOUT_FILENO)) {
 			fd = open(ctermid(NULL), O_RDONLY, 0400);
-			dup2(fd, STDIN_FILENO);
-			close(fd);
+			if (fd != -1) {
+				dup2(fd, STDIN_FILENO);
+				close(fd);
+			}
 		} else
 			dup2(STDOUT_FILENO, STDIN_FILENO);
 
@@ -9526,9 +10124,9 @@ int main(int argc, char *argv[])
 	/* Configure trash preference */
 	trashcmd = getenv(env_cfg[NNN_TRASH]);
 	if (trashcmd) {
-		if (strcmp(trashcmd, "1") == 0)
+		if ((trashcmd[0] == '1') && (trashcmd[1] == '\0'))
 			trashcmd = utils[UTIL_TRASH_CLI];
-		else if (strcmp(trashcmd, "2") == 0)
+		else if ((trashcmd[0] == '2') && (trashcmd[1] == '\0'))
 			trashcmd = utils[UTIL_GIO_TRASH];
 	}
 

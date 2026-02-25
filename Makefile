@@ -12,7 +12,7 @@ CP ?= cp
 CFLAGS_OPTIMIZATION ?= -O3
 
 O_DEBUG := 0  # debug binary
-O_NORL := 0  # no readline support
+O_NORL := 1  # no readline support
 O_PCRE2 := 0  # link with PCRE2 library
 O_NOLC := 0  # no locale support
 O_NOMOUSE := 0  # no mouse support
@@ -26,8 +26,8 @@ O_BENCH := 0  # benchmark mode (stops at first user input)
 O_NOSSN := 0  # disable session support
 O_NOUG := 0  # disable user, group name in status bar
 O_NOX11 := 0  # disable X11 integration
-O_MATCHFLTR := 0  # allow filters without matches
 O_NOSORT := 0  # disable sorting entries on dir load
+O_DIMFILTERED := 1  # dim characters matching filter (default: enabled)
 
 # User patches
 O_COLEMAK := 0 # change key bindings to colemak compatible layout
@@ -138,12 +138,12 @@ ifeq ($(strip $(O_NOX11)),1)
 	CPPFLAGS += -DNOX11
 endif
 
-ifeq ($(strip $(O_MATCHFLTR)),1)
-	CPPFLAGS += -DMATCHFLTR
-endif
-
 ifeq ($(strip $(O_NOSORT)),1)
 	CPPFLAGS += -DNOSORT
+endif
+
+ifeq ($(strip $(O_DIMFILTERED)),1)
+	CPPFLAGS += -DDIM_FILTERED
 endif
 
 ifeq ($(shell $(PKG_CONFIG) ncursesw && echo 1),1)
@@ -293,43 +293,65 @@ sign:
 
 upload-local: sign static musl
 	$(eval ID=$(shell curl -s 'https://api.github.com/repos/jarun/nnn/releases/tags/v$(VERSION)' | jq .id))
+	$(eval PKG_STATIC=$(BIN)-static)
+	$(eval PKG_ICONS=$(BIN)-icons-static)
+	$(eval PKG_NERD=$(BIN)-nerd-static)
+	$(eval PKG_EMOJI=$(BIN)-emoji-static)
+	$(eval PKG_MUSL=$(BIN)-musl-static)
+	$(eval PKG_MUSL_EMOJI=$(BIN)-musl-emoji-static)
+	$(eval ARCH=x86_64)
+
 	# upload sign file
 	curl -XPOST 'https://uploads.github.com/repos/jarun/nnn/releases/$(ID)/assets?name=nnn-$(VERSION).tar.gz.sig' \
 	    -H 'Authorization: token $(NNN_SIG_UPLOAD_TOKEN)' -H 'Content-Type: application/pgp-signature' \
 	    --upload-file nnn-$(VERSION).tar.gz.sig
+
 	# upx compress all static binaries
-	upx -qqq $(BIN)-static
-	upx -qqq $(BIN)-icons-static
-	upx -qqq $(BIN)-nerd-static
-	upx -qqq $(BIN)-emoji-static
+	upx -qqq $(PKG_STATIC)
+	upx -qqq $(PKG_ICONS)
+	upx -qqq $(PKG_NERD)
+	upx -qqq $(PKG_EMOJI)
+	upx -qqq $(PKG_MUSL)
+	upx -qqq $(PKG_MUSL_EMOJI)
+
 	# upload static binary
-	tar -zcf $(BIN)-static-$(VERSION).x86_64.tar.gz $(BIN)-static
-	curl -XPOST 'https://uploads.github.com/repos/jarun/nnn/releases/$(ID)/assets?name=$(BIN)-static-$(VERSION).x86_64.tar.gz' \
+	tar -zcf $(PKG_STATIC)-$(VERSION).$(ARCH).tar.gz $(PKG_STATIC)
+	curl -XPOST 'https://uploads.github.com/repos/jarun/nnn/releases/$(ID)/assets?name=$(PKG_STATIC)-$(VERSION).$(ARCH).tar.gz' \
 	    -H 'Authorization: token $(NNN_SIG_UPLOAD_TOKEN)' -H 'Content-Type: application/x-sharedlib' \
-	    --upload-file $(BIN)-static-$(VERSION).x86_64.tar.gz
+	    --upload-file $(PKG_STATIC)-$(VERSION).$(ARCH).tar.gz
+
 	# upload icons-in-terminal compiled static binary
-	tar -zcf $(BIN)-icons-static-$(VERSION).x86_64.tar.gz $(BIN)-icons-static
-	curl -XPOST 'https://uploads.github.com/repos/jarun/nnn/releases/$(ID)/assets?name=$(BIN)-icons-static-$(VERSION).x86_64.tar.gz' \
+	tar -zcf $(PKG_ICONS)-$(VERSION).$(ARCH).tar.gz $(PKG_ICONS)
+	curl -XPOST 'https://uploads.github.com/repos/jarun/nnn/releases/$(ID)/assets?name=$(PKG_ICONS)-$(VERSION).$(ARCH).tar.gz' \
 	    -H 'Authorization: token $(NNN_SIG_UPLOAD_TOKEN)' -H 'Content-Type: application/x-sharedlib' \
-	    --upload-file $(BIN)-icons-static-$(VERSION).x86_64.tar.gz
+	    --upload-file $(PKG_ICONS)-$(VERSION).$(ARCH).tar.gz
+
 	# upload patched nerd font compiled static binary
-	tar -zcf $(BIN)-nerd-static-$(VERSION).x86_64.tar.gz $(BIN)-nerd-static
-	curl -XPOST 'https://uploads.github.com/repos/jarun/nnn/releases/$(ID)/assets?name=$(BIN)-nerd-static-$(VERSION).x86_64.tar.gz' \
+	tar -zcf $(PKG_NERD)-$(VERSION).$(ARCH).tar.gz $(PKG_NERD)
+	curl -XPOST 'https://uploads.github.com/repos/jarun/nnn/releases/$(ID)/assets?name=$(PKG_NERD)-$(VERSION).$(ARCH).tar.gz' \
 	    -H 'Authorization: token $(NNN_SIG_UPLOAD_TOKEN)' -H 'Content-Type: application/x-sharedlib' \
-	    --upload-file $(BIN)-nerd-static-$(VERSION).x86_64.tar.gz
+	    --upload-file $(PKG_NERD)-$(VERSION).$(ARCH).tar.gz
+
 	# upload emoji compiled static binary
-	tar -zcf $(BIN)-emoji-static-$(VERSION).x86_64.tar.gz $(BIN)-emoji-static
-	curl -XPOST 'https://uploads.github.com/repos/jarun/nnn/releases/$(ID)/assets?name=$(BIN)-emoji-static-$(VERSION).x86_64.tar.gz' \
+	tar -zcf $(PKG_EMOJI)-$(VERSION).$(ARCH).tar.gz $(PKG_EMOJI)
+	curl -XPOST 'https://uploads.github.com/repos/jarun/nnn/releases/$(ID)/assets?name=$(PKG_EMOJI)-$(VERSION).$(ARCH).tar.gz' \
 	    -H 'Authorization: token $(NNN_SIG_UPLOAD_TOKEN)' -H 'Content-Type: application/x-sharedlib' \
-	    --upload-file $(BIN)-emoji-static-$(VERSION).x86_64.tar.gz
+	    --upload-file $(PKG_EMOJI)-$(VERSION).$(ARCH).tar.gz
+
 	# upload musl static binary
-	tar -zcf $(BIN)-musl-static-$(VERSION).x86_64.tar.gz $(BIN)-musl-static
-	curl -XPOST 'https://uploads.github.com/repos/jarun/nnn/releases/$(ID)/assets?name=$(BIN)-musl-static-$(VERSION).x86_64.tar.gz' \
+	tar -zcf $(PKG_MUSL)-$(VERSION).$(ARCH).tar.gz $(PKG_MUSL)
+	curl -XPOST 'https://uploads.github.com/repos/jarun/nnn/releases/$(ID)/assets?name=$(PKG_MUSL)-$(VERSION).$(ARCH).tar.gz' \
 	    -H 'Authorization: token $(NNN_SIG_UPLOAD_TOKEN)' -H 'Content-Type: application/x-sharedlib' \
-	    --upload-file $(BIN)-musl-static-$(VERSION).x86_64.tar.gz
+	    --upload-file $(PKG_MUSL)-$(VERSION).$(ARCH).tar.gz
+
+	# upload musl emoji static binary
+	tar -zcf $(PKG_MUSL_EMOJI)-$(VERSION).$(ARCH).tar.gz $(PKG_MUSL_EMOJI)
+	curl -XPOST 'https://uploads.github.com/repos/jarun/nnn/releases/$(ID)/assets?name=$(PKG_MUSL_EMOJI)-$(VERSION).$(ARCH).tar.gz' \
+	    -H 'Authorization: token $(NNN_SIG_UPLOAD_TOKEN)' -H 'Content-Type: application/x-sharedlib' \
+	    --upload-file $(PKG_MUSL_EMOJI)-$(VERSION).$(ARCH).tar.gz
 
 clean:
-	$(RM) -f $(BIN) nnn-$(VERSION).tar.gz *.sig $(BIN)-static $(BIN)-static-$(VERSION).x86_64.tar.gz $(BIN)-icons-static $(BIN)-icons-static-$(VERSION).x86_64.tar.gz $(BIN)-nerd-static $(BIN)-nerd-static-$(VERSION).x86_64.tar.gz $(BIN)-emoji-static $(BIN)-emoji-static-$(VERSION).x86_64.tar.gz $(BIN)-musl-static $(BIN)-musl-static-$(VERSION).x86_64.tar.gz src/icons-hash-gen src/icons-generated-*.h
+	$(RM) -f $(BIN) nnn-$(VERSION).tar.gz *.sig $(BIN)-static $(BIN)-static-$(VERSION).x86_64.tar.gz $(BIN)-icons-static $(BIN)-icons-static-$(VERSION).x86_64.tar.gz $(BIN)-nerd-static $(BIN)-nerd-static-$(VERSION).x86_64.tar.gz $(BIN)-emoji-static $(BIN)-emoji-static-$(VERSION).x86_64.tar.gz $(BIN)-musl-static $(BIN)-musl-static-$(VERSION).x86_64.tar.gz $(BIN)-musl-emoji-static $(BIN)-musl-emoji-static-$(VERSION).x86_64.tar.gz src/icons-hash-gen src/icons-generated-*.h
 
 checkpatches:
 	./patches/check-patches.sh

@@ -60,6 +60,7 @@ Runs on the Pi, [Termux](https://www.youtube.com/embed/AbaauM7gUJw) (Android), L
 - Navigation
   - Filter with automatic dir entry on unique match
   - *Type-to-nav* (turbo navigation/always filter) mode
+  - Jump to an entry with visible relative offset
   - Contexts (_aka_ tabs/workspaces) with custom colors
   - Sessions, bookmarks, mark and visit a dir
   - Remote mounts (needs `sshfs`, `rclone`)
@@ -68,7 +69,7 @@ Runs on the Pi, [Termux](https://www.youtube.com/embed/AbaauM7gUJw) (Android), L
   - Proceed to next file on file open and selection
 - Search
   - Instant filtering with *search-as-you-type*
-  - Regex (POSIX/PCRE2) and string (default) filters
+  - Fuzzy, regex (POSIX/PCRE2) and string (default) filters
   - Subtree search plugin to open or edit files
 - Sort
   - Ordered pure numeric names by default (visit `/proc`)
@@ -94,6 +95,7 @@ Runs on the Pi, [Termux](https://www.youtube.com/embed/AbaauM7gUJw) (Android), L
   - Batch renamer for selection or dir
   - List input stream of file paths from stdin or plugin
   - Copy (as), move (as), delete, archive, link selection
+  - Easily copy, move paths in system clipboard to current dir
   - Dir updates, notification on `cp`, `mv`, `rm` completion
   - Copy file paths to system clipboard on select
   - Launch apps, run commands, spawn a shell, toggle exe
