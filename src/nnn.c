@@ -260,6 +260,8 @@
 #define FILE_SCANNED  0x20
 #define FILE_YOUNG    0x40
 
+#define IS_DIR_OR_DIRLNK(ent) (((ent)->flags & DIR_OR_DIRLNK) != 0)
+
 /* Macros to define process spawn behaviour as flags */
 #define F_NONE    0x00  /* no flag set */
 #define F_MULTI   0x01  /* first arg can be combination of args; to be used with F_NORMAL */
@@ -356,7 +358,7 @@ typedef struct {
 	uint_t blkorder   : 1;  /* Set to sort by blocks used (disk usage) */
 	uint_t extnorder  : 1;  /* Order by extension */
 	uint_t showhidden : 1;  /* Set to show hidden files */
-	uint_t reserved0  : 1;
+	uint_t preview    : 1;  /* Show preview pane */
 	uint_t showdetail : 1;  /* Clear to show lesser file info */
 	uint_t ctxactive  : 1;  /* Context active or not */
 	uint_t reverse    : 1;  /* Reverse sort */
@@ -407,7 +409,8 @@ typedef struct {
 	uint_t usebsdtar  : 1;  /* Use bsdtar as default archive utility */
 	uint_t xprompt    : 1;  /* Use native prompt instead of readline prompt */
 	uint_t showlines  : 1;  /* Show line numbers */
-	uint_t reserved   : 5;  /* Adjust when adding/removing a field */
+	uint_t plugparsed : 1;  /* Plugin kv pairs parsed */
+	uint_t reserved   : 4;  /* Adjust when adding/removing a field */
 } runstate;
 
 /* Contexts or workspaces */
@@ -474,6 +477,7 @@ static char *plgpath;
 static char *pnamebuf, *pselbuf, *findselpos;
 static char *mark;
 static char *trashcmd;
+static char *previewer = NULL;
 #ifndef NOX11
 static char hostname[_POSIX_HOST_NAME_MAX + 1];
 #endif
@@ -487,7 +491,8 @@ static blkcnt_t dir_blocks;
 static kv *bookmark;
 static kv *plug;
 static kv *order;
-static uchar_t tmpfplen, homelen;
+static ushort_t homelen;
+static uchar_t tmpfplen;
 static uchar_t blk_shift = BLK_SHIFT_512;
 #ifndef NOMOUSE
 static int middle_click_key;
@@ -601,6 +606,7 @@ static runstate g_state;
 #define UTIL_GIO_TRASH 19
 #define UTIL_RM_RF     20
 #define UTIL_ARCHMNT   21
+#define UTIL_NPREVIEW  22
 
 /* Utilities to open files, run actions */
 static char * const utils[] = {
@@ -642,6 +648,7 @@ static char * const utils[] = {
 	"gio trash",
 	"rm -rf --",
 	"archivemount",
+	".npreview",
 };
 
 /* Common strings */
@@ -790,6 +797,17 @@ static const char * const envs[] = {
 #define T_CHANGE 1
 #define T_MOD    2
 
+/* Platform-agnostic nanosecond timestamp accessors */
+#ifdef __APPLE__
+#define NSEC_MTIME(sb) ((uint_t)(sb).st_mtimespec.tv_nsec)
+#define NSEC_ATIME(sb) ((uint_t)(sb).st_atimespec.tv_nsec)
+#define NSEC_CTIME(sb) ((uint_t)(sb).st_ctimespec.tv_nsec)
+#else
+#define NSEC_MTIME(sb) ((uint_t)(sb).st_mtim.tv_nsec)
+#define NSEC_ATIME(sb) ((uint_t)(sb).st_atim.tv_nsec)
+#define NSEC_CTIME(sb) ((uint_t)(sb).st_ctim.tv_nsec)
+#endif
+
 #define PROGRESS_CP   "cpg -giRp --"
 #define PROGRESS_MV   "mvg -gi --"
 static char cp[sizeof PROGRESS_CP] = "cp -iRp --";
@@ -819,12 +837,12 @@ static const char * const toks[] = {
 #define P_ARCHIVE_CMD 4
 
 static const char * const patterns[] = {
-	SED" -i 's|^\\(\\(.*/\\)\\(.*\\)$\\)|#\\1\\n\\3|' %s",
+	SED" -i 's|^\\(\\(.*/\\)\\(.*\\)$\\)|#\\1\\n\\3|' '%s'",
 	SED" 's|^\\([^#/][^/]\\?.*\\)$|%s/\\1|;s|^#\\(/.*\\)$|\\1|' "
-		"%s | tr '\\n' '\\0' | xargs -0 -n2 sh -c '%s \"$0\" \"$@\" < /dev/tty'",
+		"'%s' | tr '\\n' '\\0' | xargs -0 -n2 sh -c '%s \"$0\" \"$@\" < /dev/tty'",
 	"\\.(bz|bz2|gz|tar|taz|tbz|tbz2|tgz|z|zip)$", /* Basic formats that don't need external tools */
-	SED" -i 's|^%s\\(.*\\)$|%s\\1|' %s",
-	"xargs -0 %s %s < '%s'",
+	SED" -i 's|^%s\\(.*\\)$|%s\\1|' '%s'",
+	"xargs -0 %s %s < %s",
 };
 
 /* Colors */
@@ -1389,41 +1407,130 @@ static char *bmtarget(const char *filepath, char *cwd, char *buf)
 	return NULL;
 }
 
-/* wraps the argument in single quotes so it can be safely fed to shell */
-static ssize_t shell_escape(char *output, size_t outlen, const char *s)
+/**
+ * shell_escape - Escape a string for safe shell usage with single quotes
+ *
+ * @poutbuf: Pointer to output buffer pointer. If *poutbuf is NULL, memory will be
+ *           dynamically allocated. If *poutbuf is non-NULL, it must point to a
+ *           buffer of at least *outlen bytes. In dynamic allocation mode, the
+ *           caller is responsible for freeing the allocated memory.
+ *
+ * @note The logic works correctly with Unicode. The function operates on raw bytes
+ *       (char by char), and its escaping strategy is single-quoting the entire string ('...').
+ *       Inside POSIX single quotes, every byte is treated literally — no interpretation occurs
+ *       at all. The only special case is the single quote character itself ('), which is handled.
+ *
+ *       Since UTF-8 encoded Unicode never produces a 0x27 (') byte in any multi-byte sequence
+ *       sequence (all continuation bytes have the high bit set, 0x80–0xBF), the byte-by-byte
+ *       copy in the default case faithfully preserves any UTF-8 content without corruption.
+ *
+ * @outlen: Pointer to the output buffer size. When input is provided:
+ *          - The caller allocates a buffer and sets *outlen to its size
+ *          - The buffer must be at least 3 bytes
+ *          When poutbuf is NULL (dynamic allocation):
+ *          - Set *outlen to the desired initial chunk size (or 0 for default 256)
+ *          - It will be updated to track the allocated size
+ *          - The caller must free the memory in *poutbuf when done
+ *
+ * @inbuf: The input string to escape (must not be NULL)
+ *
+ * Return value: On success, returns the length of the escaped string (not including
+ *               the null terminator). On error, returns -1 and sets errno:
+ *               - EINVAL: if outlen < 3 (for fixed buffers)
+ *               - ENAMETOOLONG: if the output buffer is too small (for fixed buffers)
+ *               - ENOMEM: if memory allocation fails (for dynamic buffers)
+ *
+ * Usage examples:
+ *
+ * Example 1: Using a fixed-size buffer (caller-allocated):
+ *     char buf[256];
+ *     size_t len = sizeof(buf);
+ *     ssize_t result = shell_escape(&buf, &len, "my file.txt");
+ *     if (result >= 0) {
+ *         printf("Escaped: %s", buf);
+ *     }
+ *
+ * Example 2: Using dynamic allocation (caller must free):
+ *     char *escaped = NULL;
+ *     size_t capacity = 0;  // 0 uses default initial size
+ *     ssize_t result = shell_escape(&escaped, &capacity, "my file.txt");
+ *     if (result >= 0) {
+ *         printf("Escaped: %s", escaped);
+ *         free(escaped);
+ *     } else {
+ *         fprintf(stderr, "Error: %s", strerror(errno));
+ *     }
+ *
+ * Example 3: Dynamic allocation with specific initial size:
+ *     char *escaped = NULL;
+ *     size_t capacity = 512;  // Start with 512 byte chunks
+ *     ssize_t result = shell_escape(&escaped, &capacity, input_path);
+ *     if (result >= 0) {
+ *         use_escaped_path(escaped);
+ *         free(escaped);
+ *     }
+ */
+static ssize_t shell_escape(char **poutbuf, size_t *outlen, const char *inbuf)
 {
-	size_t n = xstrlen(s), w = 0;
+	size_t n = xstrlen(inbuf), w = 0;
+	char *buf = *poutbuf;
+	size_t buflen = 0;
+	bool is_dynamic = (buf == NULL);
 
-	if (s == output || outlen < 3) {
-		errno = EINVAL;
-		return -1;
-	}
-
-	output[w++] = '\''; /* begin single quote */
-	for (size_t r = 0; r < n; ++r) {
-		/* potentially too big: 4 for the single quote case, 2 from
-		 * outside the loop */
-		if (w + 6 >= outlen) {
-			errno = ENAMETOOLONG;
+	if (!is_dynamic) {
+		buf = *poutbuf;
+		buflen = *outlen;
+		if (buflen < 3) {
+			errno = EINVAL;
 			return -1;
 		}
+	}
 
-		switch (s[r]) {
+	/* r=0: opening quote, r=1..n: escaped chars, r=n+1: closing quote */
+	for (size_t r = 0; r < (n + 2); ++r) {
+		/* 4 for the single quote case, 1 from NULL terminator */
+		if (w + 5 >= buflen) {
+			if (is_dynamic) {
+				/* Grow buffer; realloc(NULL, ...) acts as malloc */
+				size_t newsize = buflen + (*outlen > 0 ? *outlen : 256);
+				char *newbuf = realloc(buf, newsize);
+				if (!newbuf) {
+					free(buf);
+					*poutbuf = NULL;
+					errno = ENOMEM;
+					return -1;
+				}
+				buf = newbuf;
+				buflen = newsize;
+				*poutbuf = buf;
+				*outlen = buflen;
+			} else {
+				errno = ENAMETOOLONG;
+				return -1;
+			}
+		}
+
+		if ((r == 0) || (r == (n + 1))) {
+			buf[w++] = '\'';
+			continue;
+		}
+
+		switch (inbuf[r - 1]) {
 		/* the only thing that has special meaning inside single
 		 * quotes are single quotes themselves. */
 		case '\'':
-			output[w++] = '\''; /* end single quote */
-			output[w++] = '\\'; /* put \' so it's treated as literal single quote */
-			output[w++] = '\'';
-			output[w++] = '\''; /* start single quoting again */
+			buf[w++] = '\''; /* end single quote */
+			buf[w++] = '\\'; /* put \' so it's treated as literal single quote */
+			buf[w++] = '\'';
+			buf[w++] = '\''; /* start single quoting again */
 			break;
 		default:
-			output[w++] = s[r];
+			buf[w++] = inbuf[r - 1];
 			break;
 		}
 	}
-	output[w++] = '\''; /* end single quote */
-	output[w]   = '\0'; /* nul terminator */
+
+	buf[w] = '\0'; // NOLINT
 	return w;
 }
 
@@ -1766,7 +1873,7 @@ static bool listselfile(void)
 	if (isselfileempty())
 		return FALSE;
 
-	snprintf(g_buf, CMD_LEN_MAX, "tr \'\\0\' \'\\n\' < %s", selpath);
+	snprintf(g_buf, CMD_LEN_MAX, "tr \'\\0\' \'\\n\' < '%s'", selpath);
 	spawn(utils[UTIL_SH_EXEC], g_buf, NULL, NULL, F_CLI | F_CONFIRM);
 
 	return TRUE;
@@ -1866,8 +1973,8 @@ static void invertselbuf(const int pathlen)
 	for (i = 0; i < ndents; ++i) {
 		dentp = &pdents[i];
 
-		if (!(dentp->flags & FILE_SCANNED))
-			dentp->flags |= FILE_SCANNED;
+		/* Ensure off-screen entries are reconciled with selbuf before inversion. */
+		findmarkentry(pathlen, dentp);
 
 		if (dentp->flags & FILE_SELECTED) {
 			dentp->flags ^= FILE_SELECTED; /* Clear selection status */
@@ -2041,6 +2148,14 @@ static int scanselforpath(const char *path, bool getsize)
 }
 
 /* Finish selection procedure before an operation */
+static void rmtmpfile(void)
+{
+	if (unlink(g_tmpfpath)) {
+		DPRINTF_S(strerror(errno));
+		printwarn(NULL);
+	}
+}
+
 static void endselection(bool endselmode)
 {
 	int fd;
@@ -2074,10 +2189,7 @@ static void endselection(bool endselmode)
 	if (fd == -1) {
 		DPRINTF_S(strerror(errno));
 		printwarn(NULL);
-		if (unlink(g_tmpfpath)) {
-			DPRINTF_S(strerror(errno));
-			printwarn(NULL);
-		}
+		rmtmpfile();
 		return;
 	}
 
@@ -2134,10 +2246,7 @@ static int editselection(bool allowemptysel)
 	/* Save the last modification time */
 	if (stat(g_tmpfpath, &sb)) {
 		DPRINTF_S(strerror(errno));
-		if (unlink(g_tmpfpath)) {
-			DPRINTF_S(strerror(errno));
-			printwarn(NULL);
-		}
+		rmtmpfile();
 		return -1;
 	}
 	mtime = sb.st_mtime;
@@ -2147,10 +2256,7 @@ static int editselection(bool allowemptysel)
 	fd = open(g_tmpfpath, O_RDONLY);
 	if (fd == -1) {
 		DPRINTF_S(strerror(errno));
-		if (unlink(g_tmpfpath)) {
-			DPRINTF_S(strerror(errno));
-			printwarn(NULL);
-		}
+		rmtmpfile();
 		return -1;
 	}
 
@@ -2170,10 +2276,7 @@ static int editselection(bool allowemptysel)
 		selbufrealloc(sb.st_size);
 	else if (sb.st_size > selbufpos) {
 		DPRINTF_S("edited buffer larger than previous");
-		if (unlink(g_tmpfpath)) {
-			DPRINTF_S(strerror(errno));
-			printwarn(NULL);
-		}
+		rmtmpfile();
 		goto emptyedit;
 	}
 
@@ -2181,10 +2284,8 @@ static int editselection(bool allowemptysel)
 	if (count < 0) {
 		DPRINTF_S(strerror(errno));
 		printwarn(NULL);
-		if (close(fd) || unlink(g_tmpfpath)) {
-			DPRINTF_S(strerror(errno));
-			printwarn(NULL);
-		}
+		close(fd);
+		rmtmpfile();
 		goto emptyedit;
 	}
 
@@ -2336,6 +2437,7 @@ static bool initcurses(void *oldmask)
 	mouseinterval(0);
 #endif
 	curs_set(FALSE); /* Hide cursor */
+	leaveok(stdscr, TRUE); /* Skip precise cursor placement during normal redraws */
 
 	char *colors = getenv(env_cfg[NNN_COLORS]);
 
@@ -2615,15 +2717,12 @@ static char *xgetenv(const char * const name, char *fallback)
 /* Check if a dir exists, IS a dir, and is readable */
 static bool xdiraccess(const char *path)
 {
-	DIR *dirp = opendir(path);
+	int fd = open(path, O_RDONLY | O_DIRECTORY);
 
-	if (!dirp) {
-		printwarn(NULL);
+	if (fd < 0)
 		return FALSE;
-	}
 
-	closedir(dirp);
-	return TRUE;
+	return close(fd) == 0;
 }
 
 static bool plugscript(const char *plugin, uchar_t flags)
@@ -2639,7 +2738,7 @@ static bool plugscript(const char *plugin, uchar_t flags)
 
 static void opstr(char *buf, char *op)
 {
-	snprintf(buf, CMD_LEN_MAX, "xargs -0 sh -c '%s \"$0\" \"$@\" . < /dev/tty' < %s", op, selpath);
+	snprintf(buf, CMD_LEN_MAX, "xargs -0 sh -c '%s \"$0\" \"$@\" . < /dev/tty' < '%s'", op, selpath);
 }
 
 static bool rmmulstr(char *buf, bool use_trash)
@@ -2649,10 +2748,10 @@ static bool rmmulstr(char *buf, bool use_trash)
 		return FALSE;
 
 	if (!use_trash)
-		snprintf(buf, CMD_LEN_MAX, "xargs -0 sh -c 'rm -%cvr -- \"$0\" \"$@\" < /dev/tty' < %s",
+		snprintf(buf, CMD_LEN_MAX, "xargs -0 sh -c 'rm -%cvr -- \"$0\" \"$@\" < /dev/tty' < '%s'",
 			 r, selpath);
 	else
-		snprintf(buf, CMD_LEN_MAX, "xargs -0 %s < %s",
+		snprintf(buf, CMD_LEN_MAX, "xargs -0 %s < '%s'",
 			 trashcmd, selpath);
 
 	return TRUE;
@@ -2700,10 +2799,14 @@ static void xrmfromsel(char *path, char *fpath)
 static bool cpmv_rename(int choice, const char *path)
 {
 	int fd;
+	ssize_t path_esc_ret;
 	uint_t count = 0, lines = 0;
 	bool ret = FALSE;
+	char *path_escp;
 	char *cmd = (choice == 'c' ? cp : mv);
-	char buf[sizeof(patterns[P_CPMVRNM]) + (MAX(sizeof(cp), sizeof(mv))) + (PATH_MAX << 1)];
+	char path_esc[(PATH_MAX << 2) + 3];
+	char buf[sizeof(patterns[P_CPMVRNM]) + (MAX(sizeof(cp), sizeof(mv))) + (PATH_MAX * 5)];
+	size_t path_esc_size = sizeof(path_esc);
 
 	fd = create_tmp_file();
 	if (fd == -1)
@@ -2711,7 +2814,7 @@ static bool cpmv_rename(int choice, const char *path)
 
 	/* selsafe() returned TRUE for this to be called */
 	if (!selbufpos) {
-		snprintf(buf, sizeof(buf), "tr '\\0' '\\n' < %s > %s", selpath, g_tmpfpath);
+		snprintf(buf, sizeof(buf), "tr '\\0' '\\n' < '%s' > '%s'", selpath, g_tmpfpath);
 		spawn(utils[UTIL_SH_EXEC], buf, NULL, NULL, F_CLI);
 
 		count = entries_in_file(fd, buf, sizeof(buf), NEWLINE_CHAR);
@@ -2739,7 +2842,17 @@ static bool cpmv_rename(int choice, const char *path)
 		goto finish;
 	}
 
-	snprintf(buf, sizeof(buf), patterns[P_CPMVRNM], path, g_tmpfpath, cmd);
+	/* Escape for insertion inside an existing single-quoted shell string. */
+	path_escp = path_esc;
+	path_esc_ret = shell_escape(&path_escp, &path_esc_size, path);
+	if (path_esc_ret < 2)
+		goto finish;
+
+	/* Strip outer quotes from shell_escape(), keep interior quote breaks (e.g. '\'''). */
+	path_esc[path_esc_ret - 1] = '\0';
+	memmove(path_esc, path_esc + 1, path_esc_ret - 1);
+
+	snprintf(buf, sizeof(buf), patterns[P_CPMVRNM], path_esc, g_tmpfpath, cmd);
 	if (!spawn(utils[UTIL_SH_EXEC], buf, NULL, NULL, F_CLI | F_CHKRTN))
 		ret = TRUE;
 finish:
@@ -2810,7 +2923,7 @@ static bool batch_rename(void)
 	uint_t count = 0, lines = 0;
 	bool dir = FALSE, ret = FALSE;
 	char foriginal[TMP_LEN_MAX] = {0};
-	static const char batchrenamecmd[] = "paste -d'\n' %s %s | "SED" 'N; /^\\(.*\\)\\n\\1$/!p;d' | "
+	static const char batchrenamecmd[] = "paste -d'\n' '%s' '%s' | "SED" 'N; /^\\(.*\\)\\n\\1$/!p;d' | "
 					     "tr '\n' '\\0' | xargs -0 -n2 sh -c 'mv -i -- \"$0\" \"$@\" <"
 					     " /dev/tty'";
 	char buf[sizeof(batchrenamecmd) + (PATH_MAX << 1)];
@@ -2897,18 +3010,35 @@ static char *get_archive_cmd(const char *archive)
 
 static void archive_selection(const char *cmd, const char *archive)
 {
-	size_t len = xstrlen(patterns[P_ARCHIVE_CMD]) + xstrlen(cmd) + xstrlen(archive)
-	            + xstrlen(selpath) + 1;
-	char *buf = malloc(len);
+	size_t archive_esc_size = 0;
+	size_t selpath_esc_size = 0;
+	char *archive_esc = NULL;
+	char *selpath_esc = NULL;
+	size_t len;
+	char *buf = NULL;
+
+	if (shell_escape(&archive_esc, &archive_esc_size, archive) < 0
+	    || shell_escape(&selpath_esc, &selpath_esc_size, selpath) < 0) {
+		DPRINTF_S(strerror(errno));
+		printwarn(NULL);
+		goto cleanup;
+	}
+
+	len = xstrlen(patterns[P_ARCHIVE_CMD]) + xstrlen(cmd) + xstrlen(archive_esc) + xstrlen(selpath_esc) + 1;
+	buf = malloc(len);
 	if (!buf) {
 		DPRINTF_S(strerror(errno));
 		printwarn(NULL);
-		return;
+		goto cleanup;
 	}
 
-	snprintf(buf, len, patterns[P_ARCHIVE_CMD], cmd, archive, selpath);
+	snprintf(buf, len, patterns[P_ARCHIVE_CMD], cmd, archive_esc, selpath_esc);
 	spawn(utils[UTIL_SH_EXEC], buf, NULL, NULL, F_CLI | F_CONFIRM);
+
+cleanup:
 	free(buf);
+	free(archive_esc);
+	free(selpath_esc);
 }
 
 static void write_lastdir(const char *curpath, const char *outfile)
@@ -2923,8 +3053,15 @@ static void write_lastdir(const char *curpath, const char *outfile)
 			? (tilde ? g_buf : outfile)
 			: cfgpath, O_CREAT | O_WRONLY | O_TRUNC, S_IWUSR | S_IRUSR);
 	if (fd >= 0) {
-		memcpy(g_buf, "cd ", 3);  // NOLINT
-		ssize_t l = shell_escape(g_buf + 3, sizeof(g_buf) - 3, curpath);
+		char *bufptr = g_buf;
+		size_t buflen = sizeof(g_buf) - 3;
+
+		*bufptr++ = 'c';
+		*bufptr++ = 'd';
+		*bufptr++ = ' ';
+		*bufptr = '\0';
+
+		ssize_t l = shell_escape(&bufptr, &buflen, curpath);
 		ok = l >= 0 && write(fd, g_buf, l + 3) == l + 3;
 		close(fd);
 	}
@@ -3264,6 +3401,83 @@ static int visible_fuzzy(const fltrexp_t *fltrexp, const char *fname)
 }
 
 static int (*filterfn)(const fltrexp_t *fltr, const char *fname) = &visible_str;
+static int (*entrycmpfn)(const void *va, const void *vb);
+static const char *fuzzy_sort_fltr;
+
+static int fuzzy_match_score(const char *filter, const char *fname)
+{
+	wchar_t filter_wcs[NAME_MAX], fname_wcs[NAME_MAX];
+	size_t match_pos[NAME_MAX];
+	size_t filter_len, fname_len, f_idx, n_idx;
+	bool case_insensitive = (fnstrstr == &strcasestr);
+
+	filter_len = mbstowcs(filter_wcs, filter, NAME_MAX - 1);
+	if (filter_len == (size_t)-1)
+		return INT_MAX;
+	filter_wcs[filter_len] = L'\0';
+
+	if (!filter_len)
+		return 0;
+
+	fname_len = mbstowcs(fname_wcs, fname, NAME_MAX - 1);
+	if (fname_len == (size_t)-1)
+		return INT_MAX;
+	fname_wcs[fname_len] = L'\0';
+
+	if (case_insensitive) {
+		for (size_t i = 0; i < filter_len; ++i)
+			filter_wcs[i] = towlower(filter_wcs[i]);
+		for (size_t i = 0; i < fname_len; ++i)
+			fname_wcs[i] = towlower(fname_wcs[i]);
+	}
+
+	f_idx = 0;
+	n_idx = 0;
+
+	while (f_idx < filter_len && n_idx < fname_len) {
+		if (normalize_char(filter_wcs[f_idx]) == normalize_char(fname_wcs[n_idx])) {
+			match_pos[f_idx] = n_idx;
+			++f_idx;
+		}
+		++n_idx;
+	}
+
+	if (f_idx != filter_len)
+		return INT_MAX;
+
+	{
+		size_t first = match_pos[0], endpos = match_pos[filter_len - 1], span = (endpos - first) + 1;
+		size_t gaps = span - filter_len, consec = 0, word_starts = 0;
+
+		for (size_t i = 0; i < filter_len; ++i) {
+			if (i > 0 && match_pos[i] == match_pos[i - 1] + 1)
+				++consec;
+
+			if (match_pos[i] == 0 || normalize_char(fname_wcs[match_pos[i] - 1]) == L' ')
+				++word_starts;
+		}
+
+		return (int)((gaps * 1000) + (first * 100) + ((span - consec) * 10) - (word_starts * 5));
+	}
+}
+
+static int fuzzyentrycmp(const void *va, const void *vb)
+{
+	const struct entry *pa = (const struct entry *)va;
+	const struct entry *pb = (const struct entry *)vb;
+	int sa, sb;
+
+	if (IS_DIR_OR_DIRLNK(pb) != IS_DIR_OR_DIRLNK(pa))
+		return IS_DIR_OR_DIRLNK(pb) ? 1 : -1;
+
+	sa = fuzzy_match_score(fuzzy_sort_fltr, pa->name);
+	sb = fuzzy_match_score(fuzzy_sort_fltr, pb->name);
+
+	if (sa != sb)
+		return cfg.reverse ? (sa < sb ? 1 : -1) : (sa < sb ? -1 : 1);
+
+	return cfg.reverse ? -namecmpfn(pa->name, pb->name) : namecmpfn(pa->name, pb->name);
+}
 
 static void clearfilter(void)
 {
@@ -3280,11 +3494,8 @@ static int entrycmp(const void *va, const void *vb)
 	const struct entry *pa = (pEntry)va;
 	const struct entry *pb = (pEntry)vb;
 
-	if ((pb->flags & DIR_OR_DIRLNK) != (pa->flags & DIR_OR_DIRLNK)) {
-		if (pb->flags & DIR_OR_DIRLNK)
-			return 1;
-		return -1;
-	}
+	if (IS_DIR_OR_DIRLNK(pb) != IS_DIR_OR_DIRLNK(pa))
+		return IS_DIR_OR_DIRLNK(pb) ? 1 : -1;
 
 	/* Sort based on specified order */
 	if (cfg.timeorder) {
@@ -3307,7 +3518,7 @@ static int entrycmp(const void *va, const void *vb)
 			return 1;
 		if (pb->blocks < pa->blocks)
 			return -1;
-	} else if (cfg.extnorder && !(pb->flags & DIR_OR_DIRLNK)) {
+	} else if (cfg.extnorder && !IS_DIR_OR_DIRLNK(pb)) {
 		char *extna = xextension(pa->name, pa->nlen - 1);
 		char *extnb = xextension(pb->name, pb->nlen - 1);
 
@@ -3330,12 +3541,8 @@ static int entrycmp(const void *va, const void *vb)
 
 static int reventrycmp(const void *va, const void *vb)
 {
-	if ((((pEntry)vb)->flags & DIR_OR_DIRLNK)
-	    != (((pEntry)va)->flags & DIR_OR_DIRLNK)) {
-		if (((pEntry)vb)->flags & DIR_OR_DIRLNK)
-			return 1;
-		return -1;
-	}
+	if (IS_DIR_OR_DIRLNK((pEntry)vb) != IS_DIR_OR_DIRLNK((pEntry)va))
+		return IS_DIR_OR_DIRLNK((pEntry)vb) ? 1 : -1;
 
 	return -entrycmp(va, vb);
 }
@@ -3391,7 +3598,7 @@ try_quit:
 			i = get_wch(&c);
 			if (i != ERR) {
 				if (c == ESC)
-					c = CONTROL('L');
+					c = 'q'; /* Quit context */
 				else {
 					unget_wch(c);
 					c = ';';
@@ -3584,7 +3791,12 @@ static int matches(const char *fltr)
 		regfree(&re);
 #endif
 
-	ENTSORT(pdents, ndents, entrycmpfn);
+	if (cfg.fuzzy && fltr[0]) {
+		fuzzy_sort_fltr = fltr;
+		ENTSORT(pdents, ndents, fuzzyentrycmp);
+		fuzzy_sort_fltr = NULL;
+	} else
+		ENTSORT(pdents, ndents, entrycmpfn);
 
 	return ndents;
 }
@@ -3632,6 +3844,7 @@ static int filterentries(char *path, char *lastname)
 
 	cleartimeout();
 	curs_set(TRUE);
+	leaveok(stdscr, FALSE);
 	showfilter(ln);
 
 	while ((r = get_wch(ch)) != ERR) {
@@ -3798,14 +4011,16 @@ static int filterentries(char *path, char *lastname)
 
 		if (cfg.autoenter) {
 			/* If the only match is a dir, cd into it */
-			if ((ndents == 1) && (pdents[0].flags & DIR_OR_DIRLNK)) {
+			if ((ndents == 1) && (pdents[0].flags & DIR_OR_DIRLNK) && xdiraccess(pdents[0].name)) {
 				*ch = KEY_ENTER;
 				cur = 0;
 				goto end;
 			} else if ((*ch == FILTER) && *pln) {
 				/* If an exactly matching dir is present and filter key pressed, cd into it */
 				r = dentfind(pln, ndents);
-				if ((xstrcmp(pln, pdents[r].name) == 0) && (pdents[r].flags & DIR_OR_DIRLNK)) {
+				if (((r > 0) || (xstrcmp(pln, pdents[r].name) == 0))
+						&& (pdents[r].flags & DIR_OR_DIRLNK)
+						&& xdiraccess(pdents[r].name)) {
 					*ch = KEY_ENTER;
 					cur = r;
 					goto end;
@@ -3836,6 +4051,7 @@ end:
 	copycurname();
 
 	curs_set(FALSE);
+	leaveok(stdscr, TRUE);
 	settimeout();
 
 	/* Return keys for navigation etc. */
@@ -3932,6 +4148,8 @@ static char *xreadline(const char *prefill, const char *prompt)
 	const int WCHAR_T_WIDTH = sizeof(wchar_t);
 	wint_t ch[1];
 	wchar_t * const buf = malloc(sizeof(wchar_t) * (READLINE_MAX + 1)); // 1 element extra for handling full-width characters
+	int tab_cycle = -1;   /* index into pdents for Tab cycling, -1 = inactive */
+	size_t tab_basepos = 0; /* position in buf before Tab insertion */
 
 	if (!buf)
 		errexit();
@@ -3952,11 +4170,14 @@ static char *xreadline(const char *prefill, const char *prompt)
 
 	x = getcurx(stdscr);
 	curs_set(TRUE);
+	leaveok(stdscr, FALSE);
 
 	while (1) {
 		buf[len] = ' ';
 		buf[len + 1] = ' '; // Handle full-width characters
 
+		move(xlines - 1, x);
+		clrtoeol();
 		attron(COLOR_PAIR(cfg.curctx + 1));
 		if (pos > (size_t)(xcols - x)) {
 			mvaddnwstr(xlines - 1, x, buf + (pos - (xcols - x) + 1), xcols - x + 1);
@@ -3970,6 +4191,9 @@ static char *xreadline(const char *prefill, const char *prompt)
 		r = get_wch(ch);
 		if (r == ERR)
 			continue;
+
+		if (!(r == OK && *ch == '\t'))
+			tab_cycle = -1;
 
 		if (r == OK) {
 			switch (*ch) {
@@ -3995,11 +4219,33 @@ static char *xreadline(const char *prefill, const char *prompt)
 				}
 				continue;
 			case '\t':
-				if ((len == pos) && ndents && (pos < (READLINE_MAX - xstrlen(pdents[cur].name)))) {
-					buf[pos] = '\0';
-					lpos = mbstowcs(NULL, pdents[cur].name, MB_CUR_MAX);
-					pos += mbstowcs(buf + wcslen(buf), pdents[cur].name, lpos);
-					len = pos;
+				if (ndents) {
+					int idx;
+
+					if (tab_cycle < 0) {
+						/* First Tab: start cycling from cur */
+						tab_basepos = pos;
+						/* Only allow appending at end */
+						if (len != pos)
+							continue;
+						idx = cur;
+					} else {
+						/* Subsequent Tab: remove previous insertion, advance */
+						len = pos = tab_basepos;
+						idx = (tab_cycle + 1) % ndents;
+					}
+
+					char *escptr = g_buf;
+					size_t esclen = CMD_LEN_MAX;
+					ssize_t elen = shell_escape(&escptr, &esclen, pdents[idx].name);
+
+					if (elen > 0 && (tab_basepos < (READLINE_MAX - (size_t)elen))) {
+						buf[tab_basepos] = '\0';
+						lpos = mbstowcs(NULL, g_buf, 0);
+						pos = tab_basepos + mbstowcs(buf + tab_basepos, g_buf, lpos + 1);
+						len = pos;
+						tab_cycle = idx;
+					}
 				}
 				continue;
 			case CONTROL('F'):
@@ -4148,6 +4394,7 @@ static char *xreadline(const char *prefill, const char *prompt)
 
 END:
 	curs_set(FALSE);
+	leaveok(stdscr, TRUE);
 	settimeout();
 	printmsg("");
 
@@ -4661,10 +4908,10 @@ static void printent_name(const struct entry *ent, uint_t namecols)
 			for (wchar_t *p = wbuf; *p && col < namecols; ++p, ++col) {
 				if (matched[col]) {
 					attron(match_attrs);
-					addch(*p);
+					addnwstr(p, 1);
 					attroff(match_attrs);
 				} else {
-					addch(*p);
+					addnwstr(p, 1);
 				}
 			}
 #else
@@ -4689,10 +4936,10 @@ static void printent_name(const struct entry *ent, uint_t namecols)
 			for (wchar_t *p = wbuf; *p && col < namecols; ++p, ++col) {
 				if (matched[col]) {
 					attron(match_attrs);
-					addch(*p);
+					addnwstr(p, 1);
 					attroff(match_attrs);
 				} else {
-					addch(*p);
+					addnwstr(p, 1);
 				}
 			}
 #else
@@ -4950,16 +5197,16 @@ static bool load_session(const char *sname, char **path, char **lastdir, char **
 		= g_ctx[cfg.curctx].c_fltr[0] = g_ctx[cfg.curctx].c_fltr[1] = '\0';
 
 	for (; i < CTX_MAX; ++i)
-		if ((read(fd, &g_ctx[i].c_cfg, sizeof(settings)) != (ssize_t)sizeof(settings))
+		if ((header.nameln[i] > (NAME_MAX + 1))
+			|| (header.lastln[i] > PATH_MAX)
+			|| (header.fltrln[i] > REGEX_MAX)
+			|| (header.pathln[i] > PATH_MAX)
+			|| (read(fd, &g_ctx[i].c_cfg, sizeof(settings)) != (ssize_t)sizeof(settings))
 			|| (read(fd, &g_ctx[i].color, sizeof(uint_t)) != (ssize_t)sizeof(uint_t))
-			|| (header.nameln[i] > 0
-			    && read(fd, g_ctx[i].c_name, header.nameln[i]) != (ssize_t)header.nameln[i])
-			|| (header.lastln[i] > 0
-			    && read(fd, g_ctx[i].c_last, header.lastln[i]) != (ssize_t)header.lastln[i])
-			|| (header.fltrln[i] > 0
-			    && read(fd, g_ctx[i].c_fltr, header.fltrln[i]) != (ssize_t)header.fltrln[i])
-			|| (header.pathln[i] > 0
-			    && read(fd, g_ctx[i].c_path, header.pathln[i]) != (ssize_t)header.pathln[i]))
+			|| (read(fd, g_ctx[i].c_name, header.nameln[i]) != (ssize_t)header.nameln[i])
+			|| (read(fd, g_ctx[i].c_last, header.lastln[i]) != (ssize_t)header.lastln[i])
+			|| (read(fd, g_ctx[i].c_fltr, header.fltrln[i]) != (ssize_t)header.fltrln[i])
+			|| (read(fd, g_ctx[i].c_path, header.pathln[i]) != (ssize_t)header.pathln[i]))
 			goto END;
 
 	*path = g_ctx[cfg.curctx].c_path;
@@ -5550,7 +5797,7 @@ static size_t get_fs_info(const char *path, uchar_t type)
 }
 
 /* Create non-existent parents and a file or dir */
-static bool xmktree(char *path, bool dir)
+static bool xmktree(char *path, bool dir, bool tree)
 {
 	char *p = path;
 	char *slash = path;
@@ -5558,46 +5805,50 @@ static bool xmktree(char *path, bool dir)
 	if (!p || !*p)
 		return FALSE;
 
-	/* Skip the first '/' */
-	++p;
+	if (tree) {
+		/* Skip the first '/' */
+		++p;
 
-	while (*p != '\0') {
-		if (*p == '/') {
-			slash = p;
-			*p = '\0';
-		} else {
-			++p;
-			continue;
-		}
+		while (*p != '\0') {
+			if (*p == '/') {
+				slash = p;
+				*p = '\0';
+			} else {
+				++p;
+				continue;
+			}
 
-		/* Create folder from path to '\0' inserted at p */
-		if (mkdir(path, 0777) == -1 && errno != EEXIST) {
-#ifdef __HAIKU__
-			// XDG_CONFIG_HOME contains a directory
-			// that is read-only, but the full path
-			// is writeable.
-			// Try to continue and see what happens.
-			// TODO: Find a more robust solution.
-			if (errno == B_READ_ONLY_DEVICE)
-				goto next;
+			/* Create folder from path to '\0' inserted at p */
+			if (mkdir(path, 0777) == -1 && errno != EEXIST) {
+#ifdef _HAIKU__
+				// XDG_CONFIG_HOME contains a directory
+				// that is read-only, but the full path
+				// is writeable.
+				// Try to continue and see what happens.
+				// TODO: Find a more robust solution.
+				if (errno == B_READ_ONLY_DEVICE)
+					goto next;
 #endif
-			DPRINTF_S("mkdir1!");
-			DPRINTF_S(strerror(errno));
-			*slash = '/';
-			return FALSE;
-		}
+				DPRINTF_S("mkdir1!");
+				DPRINTF_S(path);
+				DPRINTF_S(strerror(errno));
+				*slash = '/';
+				return FALSE;
+			}
 
-#ifdef __HAIKU__
+#ifdef _HAIKU__
 next:
 #endif
-		/* Restore path */
-		*slash = '/';
-		++p;
+			/* Restore path */
+			*slash = '/';
+			++p;
+		}
 	}
 
 	if (dir) {
 		if (mkdir(path, 0777) == -1 && errno != EEXIST) {
 			DPRINTF_S("mkdir2!");
+			DPRINTF_S(path);
 			DPRINTF_S(strerror(errno));
 			return FALSE;
 		}
@@ -5632,7 +5883,7 @@ static bool handle_archive(char *fpath /* in-out param */, char op)
 		}
 		/* Do not create smart context for current dir */
 		if (!(*outdir == '.' && outdir[1] == '\0')) {
-			if (!xmktree(outdir, TRUE) || (chdir(outdir) == -1)) {
+			if (!xmktree(outdir, TRUE, TRUE) || (chdir(outdir) == -1)) {
 				printwarn(NULL);
 				return FALSE;
 			}
@@ -5752,7 +6003,7 @@ static bool archive_mount(char *newpath)
 	mkpath(mntpath, dir, newpath);
 	free(dir);
 
-	if (!xmktree(newpath, TRUE)) {
+	if (!xmktree(newpath, TRUE, TRUE)) {
 		printwarn(NULL);
 		return FALSE;
 	}
@@ -5810,7 +6061,7 @@ static bool remote_mount(char *newpath)
 	/* Create the mount point */
 	mkpath(cfgpath, toks[TOK_MNT], mntpath);
 	mkpath(mntpath, tmp, newpath);
-	if (!xmktree(newpath, TRUE)) {
+	if (!xmktree(newpath, TRUE, TRUE)) {
 		printwarn(NULL);
 		return FALSE;
 	}
@@ -5937,6 +6188,18 @@ static void printkv(kv *kvarr, FILE *f, uchar_t max, uchar_t id)
 		fprintf(f, " %c: %s\n", (char)kvarr[i].key, val + kvarr[i].off);
 }
 
+static bool lazy_parse_plug(void)
+{
+	if (!g_state.plugparsed) {
+		g_state.plugparsed = 1;
+		if (!parsekvpair(&plug, &pluginstr, NNN_PLUG, &maxplug)) {
+			printwait(env_cfg[NNN_PLUG], NULL);
+			return FALSE;
+		}
+	}
+	return TRUE;
+}
+
 static void printkeys(kv *kvarr, char *buf, uchar_t max)
 {
 	uchar_t i = 0;
@@ -6028,19 +6291,19 @@ static void show_help(const char *path)
 	       "9g ^A  Top%21J  Jump to entry/offset\n"
 	       "9G ^E  End%20^J  Toggle auto-advance on open\n"
 	      "8B (,)  Book(mark)%11b ^/  Select bookmark\n"
-		"a1-4  Context%11(Sh)Tab  Cycle/new context\n"
+		"a1-8  Context%11(Sh)Tab  Cycle/new context\n"
 	    "62Esc ^Q  Quit%19^y  Next young\n"
 		 "b^G  QuitCD%18Q  Pick/err, quit\n"
-		  "cq  Quit context\n"
+	  "4q Alt+Esc  Quit context%12d  Detail mode toggle\n"
 	"0\n"
 	"1FILTER & PROMPT\n"
 		  "c/  Filter%17^N  Toggle type-to-nav\n"
-		"aEsc  Exit prompt%12^L  Toggle last filter\n"
-		  "c.  Toggle hidden%05Alt+Esc  Unfilter, quit context\n"
+		"aEsc  Exit prompt%12^L  Clear/apply filter\n"
+		  "c.  Toggle hidden\n"
 	"0\n"
 	"1FILES\n"
 	       "9o ^O  Open with%15n  Create new/link\n"
-	       "9f ^F  File stats%14d  Detail mode toggle\n"
+	       "9f ^F  File stats%14P  Preview toggle\n"
 		 "b^R  Rename/dup%14r  Batch rename\n"
 		  "cz  Archive%17e  Edit file\n"
 		  "c*  Toggle exe%14>  Export list\n"
@@ -6106,12 +6369,15 @@ static void show_help(const char *path)
 	fprintf(f, "used:%s ", coolsize(get_fs_info(path, VFS_USED)));
 	fprintf(f, "size:%s\n\n", coolsize(get_fs_info(path, VFS_SIZE)));
 
-	if (bookmark) {
+	if (bookmark || mark) {
 		fprintf(f, "BOOKMARKS\n");
 		printkv(bookmark, f, maxbm, NNN_BMS);
+		if (mark)
+			fprintf(f, " ,: %s\n", mark);
 		fprintf(f, "\n");
 	}
 
+	lazy_parse_plug();
 	if (plug) {
 		fprintf(f, "PLUGIN KEYS\n");
 		printkv(plug, f, maxplug, NNN_PLUG);
@@ -6310,7 +6576,7 @@ static bool run_plugin(char **path, const char *file, char *runfile, char **last
 		} else if (*file == '>') { /* Check if floating window should be used */
 			flags |= F_WINDOW;
 			++file;
-			*action = SEL_REDRAW;
+			//*action = SEL_REDRAW;
 		} else if (*file == '&') { /* Check if GUI flags are to be used */
 			flags = F_MULTI | F_NOTRACE | F_NOWAIT;
 			++file;
@@ -6413,8 +6679,10 @@ static bool prompt_run(void)
 	int cnt_j, cnt_J, cmd_ret;
 	size_t len;
 
-	const char *xargs_j = "xargs -0 -I{} %s < %s";
-	const char *xargs_J = "xargs -0 %s < %s";
+	/* Run the command once per selected file */
+	const char *xargs_j = "xargs -0 -I{} %s < '%s'";
+	/* Append all selected files as arguments at once to the command */
+	const char *xargs_J = "xargs -0 %s < '%s'";
 	char cmd[CMD_LEN_MAX + 32]; // 32 for xargs format strings
 
 
@@ -6594,6 +6862,17 @@ static inline void add_blocks(blkcnt_t *tblocks, const struct stat *sb)
 		*tblocks += sb->st_blocks;
 }
 
+/* Stat entry only if not already cached */
+static inline bool lazy_stat(int fd, const char *name, struct stat *sb, bool *valid)
+{
+	if (!*valid) {
+		if (fstatat(fd, name, sb, AT_SYMLINK_NOFOLLOW) == -1)
+			return false;
+		*valid = true;
+	}
+	return true;
+}
+
 static void du_walk_dir(const char *root, du_group *group, bool count_root, ullong_t *tfiles, blkcnt_t *tblocks)
 {
 	struct stat sb_root;
@@ -6636,20 +6915,12 @@ static void du_walk_dir(const char *root, du_group *group, bool count_root, ullo
 
 		/* Count blocks for directories and regular files */
 		if (is_dir) {
-			/* Stat if we haven't already */
-			if (!sb_valid) {
-				if (fstatat(dfd, dp->d_name, &sb, AT_SYMLINK_NOFOLLOW) == -1)
-					continue;
-				sb_valid = true;
-			}
+			if (!lazy_stat(dfd, dp->d_name, &sb, &sb_valid))
+				continue;
 			add_blocks(tblocks, &sb);
 		} else if (is_reg) {
-			/* Stat if we haven't already */
-			if (!sb_valid) {
-				if (fstatat(dfd, dp->d_name, &sb, AT_SYMLINK_NOFOLLOW) == -1)
-					continue;
-				sb_valid = true;
-			}
+			if (!lazy_stat(dfd, dp->d_name, &sb, &sb_valid))
+				continue;
 			/* Do not recount hard links */
 			if (sb.st_size && (sb.st_nlink <= 1 || test_set_bit((uint_t)sb.st_ino)))
 				add_blocks(tblocks, &sb);
@@ -6659,11 +6930,8 @@ static void du_walk_dir(const char *root, du_group *group, bool count_root, ullo
 
 		/* Add subdirectories to task queue for worker threads */
 		if (is_dir) {
-			/* Stat if we haven't already to get device for xdev check */
-			if (!sb_valid) {
-				if (fstatat(dfd, dp->d_name, &sb, AT_SYMLINK_NOFOLLOW) == -1)
-					continue;
-			}
+			if (!lazy_stat(dfd, dp->d_name, &sb, &sb_valid))
+				continue;
 			if (sb.st_dev == root_dev) {
 				char childbuf[PATH_MAX];
 				mkpath(root, dp->d_name, childbuf);
@@ -6682,6 +6950,7 @@ static void *du_worker_loop(void *p_data)
 	du_task task = {0};
 
 #ifdef __linux__
+#ifndef __TERMUX__
 	/* Pin thread to specific CPU core for better cache locality and parallelism */
 	cpu_set_t cpuset;
 	CPU_ZERO(&cpuset);
@@ -6689,6 +6958,7 @@ static void *du_worker_loop(void *p_data)
 	if (num_cpus > 0)
 		CPU_SET(core % num_cpus, &cpuset);
 	pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+#endif
 #endif
 
 	for (;;) {
@@ -7019,25 +7289,13 @@ static int dentfill(char *path, struct entry **ppdents)
 		/* Copy other fields */
 		if (cfg.timetype == T_MOD) {
 			dentp->sec = sb.st_mtime;
-#ifdef __APPLE__
-			dentp->nsec = (uint_t)sb.st_mtimespec.tv_nsec;
-#else
-			dentp->nsec = (uint_t)sb.st_mtim.tv_nsec;
-#endif
+			dentp->nsec = NSEC_MTIME(sb);
 		} else if (cfg.timetype == T_ACCESS) {
 			dentp->sec = sb.st_atime;
-#ifdef __APPLE__
-			dentp->nsec = (uint_t)sb.st_atimespec.tv_nsec;
-#else
-			dentp->nsec = (uint_t)sb.st_atim.tv_nsec;
-#endif
+			dentp->nsec = NSEC_ATIME(sb);
 		} else {
 			dentp->sec = sb.st_ctime;
-#ifdef __APPLE__
-			dentp->nsec = (uint_t)sb.st_ctimespec.tv_nsec;
-#else
-			dentp->nsec = (uint_t)sb.st_ctim.tv_nsec;
-#endif
+			dentp->nsec = NSEC_CTIME(sb);
 		}
 
 		if ((gtimesecs - sb.st_mtime <= 300) || (gtimesecs - sb.st_ctime <= 300))
@@ -7406,6 +7664,15 @@ static int handle_context_switch(enum action sel)
 	return r;
 }
 
+static void reset_sort_flags(void)
+{
+	cfg.timeorder = 0;
+	cfg.sizeorder = 0;
+	cfg.apparentsz = 0;
+	cfg.blkorder = 0;
+	cfg.extnorder = 0;
+}
+
 static int set_sort_flags(int r)
 {
 	bool session = (r == '\0');
@@ -7468,55 +7735,44 @@ static int set_sort_flags(int r)
 		endselection(TRUE); /* We are going to reload dir */
 		break;
 	case 'c':
-		cfg.timeorder = 0;
-		cfg.sizeorder = 0;
-		cfg.apparentsz = 0;
-		cfg.blkorder = 0;
-		cfg.extnorder = 0;
+		reset_sort_flags();
 		cfg.reverse = 0;
 		cfg.version = 0;
 		entrycmpfn = &entrycmp;
 		namecmpfn = &xstricmp;
 		break;
-	case 'e': /* File extension */
-		cfg.extnorder ^= 1;
-		cfg.sizeorder = 0;
-		cfg.timeorder = 0;
-		cfg.apparentsz = 0;
-		cfg.blkorder = 0;
+	case 'e': /* File extension */ {
+		bool val = cfg.extnorder ^ 1;
+		reset_sort_flags();
+		cfg.extnorder = val;
 		cfg.reverse = 0;
 		entrycmpfn = &entrycmp;
 		break;
+	}
 	case 'r': /* Reverse sort */
 		cfg.reverse ^= 1;
 		entrycmpfn = cfg.reverse ? &reventrycmp : &entrycmp;
 		break;
-	case 's': /* File size */
-		cfg.sizeorder ^= 1;
-		cfg.timeorder = 0;
-		cfg.apparentsz = 0;
-		cfg.blkorder = 0;
-		cfg.extnorder = 0;
+	case 's': /* File size */ {
+		bool val = cfg.sizeorder ^ 1;
+		reset_sort_flags();
+		cfg.sizeorder = val;
 		cfg.reverse = 0;
 		entrycmpfn = &entrycmp;
 		break;
-	case 't': /* Time */
-		cfg.timeorder ^= 1;
-		cfg.sizeorder = 0;
-		cfg.apparentsz = 0;
-		cfg.blkorder = 0;
-		cfg.extnorder = 0;
+	}
+	case 't': /* Time */ {
+		bool val = cfg.timeorder ^ 1;
+		reset_sort_flags();
+		cfg.timeorder = val;
 		cfg.reverse = 0;
 		entrycmpfn = &entrycmp;
 		break;
+	}
 	case 'v': /* Version */
 		cfg.version ^= 1;
 		namecmpfn = cfg.version ? &xstrverscasecmp : &xstricmp;
-		cfg.timeorder = 0;
-		cfg.sizeorder = 0;
-		cfg.apparentsz = 0;
-		cfg.blkorder = 0;
-		cfg.extnorder = 0;
+		reset_sort_flags();
 		break;
 	default:
 		return 0;
@@ -7681,6 +7937,272 @@ static inline void markhovered(void)
 	}
 }
 
+#define PREVIEW_BORDER_COL (xcols / 2)
+#define PREVIEW_COL        (PREVIEW_BORDER_COL + 2)
+#define PREVIEW_WIDTH      (xcols - PREVIEW_COL - 1)
+#define MIN_PREVIEW_COLS   40
+#define PREVIEW_MAX_LINE   4096
+
+/* Check if a file is likely text by reading initial bytes */
+static bool is_text_file(const char *fpath)
+{
+	int fd = open(fpath, O_RDONLY);
+	if (fd == -1)
+		return FALSE;
+
+	unsigned char buf[512];
+	ssize_t n = read(fd, buf, sizeof(buf));
+	close(fd);
+
+	if (n <= 0)
+		return FALSE;
+
+	/* Reject known binary magic signatures */
+	static const struct {
+		const unsigned char bytes[8];
+		unsigned char len;
+	} magics[] = {
+		{ { '%',  'P',  'D',  'F'              }, 4 }, /* PDF */
+		{ { 0x89, 'P',  'N',  'G'              }, 4 }, /* PNG */
+		{ { 'G',  'I',  'F',  '8'              }, 4 }, /* GIF */
+		{ { 0xFF, 0xD8, 0xFF                   }, 3 }, /* JPEG */
+		{ { 'P',  'K',  0x03, 0x04             }, 4 }, /* ZIP */
+		{ { 0x7F, 'E',  'L',  'F'              }, 4 }, /* ELF */
+		{ { 0x1F, 0x8B                         }, 2 }, /* Gzip */
+		{ { 'B',  'M'                          }, 2 }, /* BMP */
+		{ { 'R',  'I',  'F',  'F'              }, 4 }, /* RIFF */
+		{ { 'O',  'g',  'g',  'S'              }, 4 }, /* OGG */
+		{ { 'f',  'L',  'a',  'C'              }, 4 }, /* FLAC */
+		{ { 'I',  'D',  '3'                    }, 3 }, /* MP3 ID3 */
+		{ { 0xFE, 0xED, 0xFA                   }, 3 }, /* Mach-O */
+		{ { 0xFD, '7',  'z',  'X',  'Z',  0x00 }, 6 }, /* XZ */
+		{ { '7',  'z',  0xBC, 0xAF, 0x27, 0x1C }, 6 }, /* 7z */
+		{ { 'S',  'Q',  'L',  'i',  't',  'e'  }, 6 }, /* SQLite */
+	};
+
+	for (size_t i = 0; i < sizeof(magics) / sizeof(magics[0]); ++i) {
+		if (n >= magics[i].len
+		    && !memcmp(buf, magics[i].bytes, magics[i].len))
+			return FALSE;
+	}
+
+	/* MP3 sync word (needs mask check) */
+	if (n >= 2 && buf[0] == 0xFF && (buf[1] & 0xE0) == 0xE0)
+		return FALSE;
+
+	/* Check for NUL bytes and non-text control characters */
+	for (ssize_t i = 0; i < n; ++i) {
+		unsigned char c = buf[i];
+		if (c == '\0')
+			return FALSE;
+		/* Reject most control chars except common text ones */
+		if (c < 0x20 && c != '\n' && c != '\r' && c != '\t'
+		    && c != '\f' && c != '\033') /* ESC for ANSI */
+			return FALSE;
+	}
+
+	return TRUE;
+}
+
+/* Draw the preview pane for the currently hovered file */
+static void preview_pane(const char *path)
+{
+	if (!ndents || !cfg.preview)
+		return;
+
+	int previewcol = PREVIEW_BORDER_COL;
+	int previewwidth = PREVIEW_WIDTH;
+
+	if (previewwidth < MIN_PREVIEW_COLS)
+		return;
+
+	/* Draw vertical border */
+	for (int i = 0; i < xlines - 1; ++i) {
+		move(i, previewcol);
+		addch(ACS_VLINE | A_DIM);
+	}
+
+	char fpath[PATH_MAX];
+	mkpath(path, pdents[cur].name, fpath);
+
+	/* Auto-detect .npreview plugin */
+	if (!previewer) {
+		previewer = malloc(xstrlen(plgpath) + xstrlen(utils[UTIL_NPREVIEW]) + 1);
+		mkpath(plgpath, utils[UTIL_NPREVIEW], previewer);
+		if (access(previewer, X_OK)) {
+			free(previewer);
+			previewer = NULL;
+		}
+	}
+
+	if (previewer) {
+		int pipefd[2];
+		if (pipe(pipefd) == -1)
+			return;
+
+		pid_t pid = fork();
+		if (pid == 0) {
+			close(pipefd[0]);
+			dup2(pipefd[1], STDOUT_FILENO);
+			dup2(pipefd[1], STDERR_FILENO);
+			close(pipefd[1]);
+
+			char widthbuf[16], heightbuf[16];
+			snprintf(widthbuf, sizeof(widthbuf), "%d", previewwidth);
+			snprintf(heightbuf, sizeof(heightbuf), "%d", xlines - 2);
+
+			execlp(previewer, previewer, fpath,
+			       widthbuf, heightbuf,
+			       (char *)NULL);
+			_exit(EXIT_FAILURE);
+		}
+		close(pipefd[1]);
+
+		if (pid > 0) {
+			FILE *fp = fdopen(pipefd[0], "r");
+			if (fp) {
+				char line[PREVIEW_MAX_LINE];
+				int row = 1;
+				int maxrows = xlines - 2;
+
+				while (row < maxrows && fgets(line, sizeof(line), fp)) {
+					size_t len = xstrlen(line);
+					if (len > 0 && line[len - 1] == '\n')
+						line[--len] = '\0';
+					if (len > 0 && line[len - 1] == '\r')
+						line[--len] = '\0';
+
+					/* Replace tabs with spaces */
+					for (size_t i = 0; i < len; ++i)
+						if (line[i] == '\t')
+							line[i] = ' ';
+
+					/* Wrap long lines across multiple rows */
+					int off = 0;
+					do {
+						char save = '\0';
+						if ((int)(len - off) > previewwidth) {
+							save = line[off + previewwidth];
+							line[off + previewwidth] = '\0';
+						}
+						mvaddstr(row, PREVIEW_COL, line + off);
+						if (save)
+							line[off + previewwidth] = save;
+						++row;
+						off += previewwidth;
+					} while (off < (int)len && row < maxrows);
+				}
+				fclose(fp);
+			} else {
+				close(pipefd[0]);
+			}
+			waitpid(pid, NULL, 0);
+		} else {
+			close(pipefd[0]);
+		}
+		return;
+	}
+
+	struct stat sb;
+	if (lstat(fpath, &sb) == -1)
+		return;
+
+	/* For directories, show entry count */
+	if (S_ISDIR(sb.st_mode)) {
+		DIR *dirp = opendir(fpath);
+		if (!dirp)
+			return;
+
+		int count = 0;
+		struct dirent *dp;
+		char namebuf[PATH_MAX];
+		int maxlines = xlines - 4; /* Leave header and status lines */
+
+		mvaddstr(1, PREVIEW_COL, "[directory]");
+
+		while ((dp = readdir(dirp)) && count < maxlines) {
+			if (dp->d_name[0] == '.' && (!dp->d_name[1]
+			    || (dp->d_name[1] == '.' && !dp->d_name[2])))
+				continue;
+			snprintf(namebuf, sizeof(namebuf), "%.*s",
+				 previewwidth, dp->d_name);
+			mvaddstr(2 + count, PREVIEW_COL, namebuf);
+			++count;
+		}
+		closedir(dirp);
+		return;
+	}
+
+	/* For symlinks, resolve and show target */
+	if (S_ISLNK(sb.st_mode)) {
+		char target[PATH_MAX];
+		ssize_t len = readlink(fpath, target, sizeof(target) - 1);
+		if (len > 0) {
+			target[len] = '\0';
+			mvprintw(1, PREVIEW_COL, "-> %.*s", previewwidth - 3, target);
+		}
+		/* Resolve symlink for further preview */
+		if (stat(fpath, &sb) == -1)
+			return;
+		if (!S_ISREG(sb.st_mode))
+			return;
+	}
+
+	/* For regular files, show content preview if text */
+	if (S_ISREG(sb.st_mode)) {
+		if (sb.st_size == 0) {
+			mvaddstr(1, PREVIEW_COL, "[empty file]");
+			return;
+		}
+
+		if (!is_text_file(fpath)) {
+			char szbuf[32];
+			mvprintw(1, PREVIEW_COL, "[binary %s]",
+				 coolsize(sb.st_size));
+			(void)szbuf;
+			return;
+		}
+
+		FILE *fp = fopen(fpath, "r");
+		if (!fp)
+			return;
+
+		char line[PREVIEW_MAX_LINE];
+		int row = 1;
+		int maxrows = xlines - 2; /* Leave top and bottom lines */
+
+		while (row < maxrows && fgets(line, sizeof(line), fp)) {
+			/* Strip trailing newline */
+			size_t len = xstrlen(line);
+			if (len > 0 && line[len - 1] == '\n')
+				line[--len] = '\0';
+			if (len > 0 && line[len - 1] == '\r')
+				line[--len] = '\0';
+
+			/* Replace tabs with spaces for consistent display */
+			for (size_t i = 0; i < len; ++i)
+				if (line[i] == '\t')
+					line[i] = ' ';
+
+			/* Wrap long lines across multiple rows */
+			int off = 0;
+			do {
+				char save = '\0';
+				if ((int)(len - off) > previewwidth) {
+					save = line[off + previewwidth];
+					line[off + previewwidth] = '\0';
+				}
+				mvaddstr(row, PREVIEW_COL, line + off);
+				if (save)
+					line[off + previewwidth] = save;
+				++row;
+				off += previewwidth;
+			} while (off < (int)len && row < maxrows);
+		}
+		fclose(fp);
+	}
+}
+
 static int adjust_cols(int n)
 {
 	/* Calculate the number of cols available to print entry name */
@@ -7740,13 +8262,20 @@ static void redraw(char *path)
 	getmaxyx(stdscr, xlines, xcols);
 
 	int ncols = (xcols <= PATH_MAX) ? xcols : PATH_MAX;
+	/* Limit listing width when preview pane is active */
+	if (cfg.preview && xcols >= ((MIN_PREVIEW_COLS * 2) + 1)) {
+		int listcols = PREVIEW_BORDER_COL;
+		if (ncols > listcols)
+			ncols = listcols;
+	}
 	int i, j = 1;
 
 	// Fast redraw
 	if (g_state.move) {
 		g_state.move = 0;
 
-		if (ndents && (last_curscroll == curscroll))
+		if (ndents && (last_curscroll == curscroll)
+		    && !cfg.preview)
 			return draw_line(ncols);
 	}
 
@@ -7869,6 +8398,9 @@ static void redraw(char *path)
 	}
 
 	markhovered();
+
+	if (cfg.preview)
+		preview_pane(path);
 }
 
 static bool cdprep(char *lastdir, char *lastname, char *path, char *newpath)
@@ -8558,6 +9090,7 @@ nochange:
 		case SEL_MFLTR: // fallthrough
 		case SEL_HIDDEN: // fallthrough
 		case SEL_DETAIL: // fallthrough
+		case SEL_PREVIEW: // fallthrough
 		case SEL_SORT:
 			switch (sel) {
 			case SEL_MFLTR:
@@ -8582,6 +9115,9 @@ nochange:
 			case SEL_DETAIL:
 				cfg.showdetail ^= 1;
 				cfg.blkorder = 0;
+				continue;
+			case SEL_PREVIEW:
+				cfg.preview ^= 1;
 				continue;
 			default: /* SEL_SORT */
 				r = set_sort_flags(get_input(messages[MSG_ORDER]));
@@ -9024,7 +9560,7 @@ nochange:
 
 				/* Check if it's a dir or file */
 				if (r == 'f' || r == 'd') {
-					ret = xmktree(tmp, r == 'f' ? FALSE : TRUE);
+					ret = xmktree(tmp, r == 'f' ? FALSE : TRUE, TRUE);
 				} else if (r == 's' || r == 'h') {
 					if (nselected > 1 && tmp[0] == '@' && tmp[1] == '\0')
 						tmp[0] = '\0';
@@ -9061,6 +9597,7 @@ nochange:
 				goto nochange;
 			}
 
+			lazy_parse_plug();
 			if (!pkey) {
 				r = xstrsncpy(g_buf, messages[MSG_KEYS], CMD_LEN_MAX);
 				printkeys(plug, g_buf + r - 1, maxplug);
@@ -9106,9 +9643,7 @@ nochange:
 
 				if (!r) {
 					cfg.filtermode ? presel = FILTER : statusbar(path);
-
-					if (action != SEL_REDRAW)
-						goto nochange;
+					break;
 				}
 			} else { /* 'Return/Enter' enters the plugin directory */
 				g_state.runplugin ^= 1;
@@ -9327,7 +9862,7 @@ static char *make_tmp_tree(char **paths, ssize_t entries, const char *prefix)
 			*slash = '\0';
 
 		if (access(tmpdir, F_OK)) /* Create directory if it doesn't exist */
-			xmktree(tmpdir, TRUE);
+			xmktree(tmpdir, TRUE, TRUE);
 
 		if (slash)
 			*slash = '/';
@@ -9624,11 +10159,17 @@ static bool setup_config(void)
 	xstrsncpy(cfgpath + r - 1, "/nnn", len - r);
 	DPRINTF_S(cfgpath);
 
+	if (!xmktree(cfgpath, TRUE, TRUE)) {
+		DPRINTF_S(cfgpath);
+		xerror();
+		return FALSE;
+	}
+
 	/* Create bookmarks, sessions, mounts and plugins directories */
 	for (r = 0; r < ELEMENTS(toks); ++r) {
 		mkpath(cfgpath, toks[r], plgpath);
 		/* The dirs are created on first run, check if they already exist */
-		if (access(plgpath, F_OK) && !xmktree(plgpath, TRUE)) {
+		if (!xmktree(plgpath, TRUE, FALSE)) {
 			DPRINTF_S(toks[r]);
 			xerror();
 			return FALSE;
@@ -9693,6 +10234,7 @@ static void cleanup(void)
 	free(dir_dispatched_bmp);
 	free(bookmark);
 	free(plug);
+	free(previewer);
 	if (lastcmdpos != INVALID_POS)
 		for (uchar_t pos = 0; pos <= lastcmdpos; ++pos)
 			free(cmd_hist[pos]);
@@ -9943,7 +10485,7 @@ int main(int argc, char *argv[])
 		return EXIT_FAILURE;
 	}
 	DPRINTF_S(home);
-	homelen = (uchar_t)xstrlen(home);
+	homelen = (ushort_t)xstrlen(home);
 
 	if (!setup_config())
 		return EXIT_FAILURE;
@@ -9955,12 +10497,6 @@ int main(int argc, char *argv[])
 	/* Parse bookmarks string */
 	if (!parsekvpair(&bookmark, &bmstr, NNN_BMS, &maxbm)) {
 		msg(env_cfg[NNN_BMS]);
-		return EXIT_FAILURE;
-	}
-
-	/* Parse plugins string */
-	if (!parsekvpair(&plug, &pluginstr, NNN_PLUG, &maxplug)) {
-		msg(env_cfg[NNN_PLUG]);
 		return EXIT_FAILURE;
 	}
 
@@ -10029,7 +10565,7 @@ int main(int argc, char *argv[])
 					g_state.initfile = 1;
 				}
 				if (dir || (arg != initpath)) { /* We have a directory */
-					if (!xdiraccess(initpath) && !xmktree(initpath, TRUE)) {
+					if (!xdiraccess(initpath) && !xmktree(initpath, TRUE, TRUE)) {
 						xerror(); /* Fail if directory cannot be created */
 						return EXIT_FAILURE;
 					}
@@ -10154,7 +10690,8 @@ int main(int argc, char *argv[])
 
 #ifndef NOLC
 	/* Set locale */
-	setlocale(LC_ALL, "");
+	setlocale(LC_COLLATE, "");
+	setlocale(LC_CTYPE, "");
 #ifdef PCRE2
 	tables = pcre2_maketables(NULL);
 #endif
